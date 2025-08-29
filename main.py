@@ -1288,7 +1288,7 @@ def order_info(message):
             f"⚙️ Управление: /order_status {order_id} [статус]"
         )
         
-        bot.send_message(user_id, info_text, reply_markup=create_order_status_buttons(order_id))
+        bot.send_message(user_id, info_text, reply_markup=buttons.create_order_status_buttons(order_id))
         
     except (IndexError, ValueError):
         bot.send_message(user_id, "❌ Неверный формат команды")
