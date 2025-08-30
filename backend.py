@@ -77,7 +77,6 @@ class DbAct:
             )
             
             if result:
-                # Получаем ID последней вставленной записи
                 last_id_data = self.__db.db_read('SELECT last_insert_rowid()')
                 if last_id_data:
                     return last_id_data[0][0]
@@ -174,7 +173,6 @@ class DbAct:
     def import_products_from_excel(self, df):
         success_count = 0
         
-        # Сначала очищаем старые товары
         self.clear_all_products()
         
         grouped = df.groupby('Модель')
@@ -203,7 +201,6 @@ class DbAct:
                 
                 print(f"Добавляем товар: {model_name}, цена: {price}, цена Y: {price_yuan}")
                 
-                # Добавляем товар в таблицу products
                 product_id = self.add_product(
                     name=str(model_name),
                     description=f"Модель: {model_name}",
@@ -227,13 +224,12 @@ class DbAct:
                             
                             if not size:
                                 continue
-                                
-                            # Для каждой вариации используем правильный product_id
+                            
                             variation_price = get_safe_value(row, 'Цена', price)
                             variation_price_yuan = get_safe_value(row, 'Цена Y', price_yuan)
                             
                             self.add_product_variation(
-                                product_id=product_id,  # ← Используем текущий product_id
+                                product_id=product_id,
                                 model_id=model_id,
                                 size=size,
                                 quantity=quantity,
@@ -445,7 +441,6 @@ class DbAct:
             traceback.print_exc()
             return None
         
-    # В класс DbAct добавьте:
     def save_order_message_id(self, order_id, message_id, topic_id):
         try:
             columns = self.__db.db_read("PRAGMA table_info(orders_detailed)")

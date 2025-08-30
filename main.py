@@ -517,14 +517,12 @@ def confirm_order(message):
             bot.send_message(user_id, "❌ Товар не найден")
             return
         
-        # Уменьшаем количество товара
         if size:
             success = db_actions.decrease_product_quantity(product_id, size)
             if not success:
                 bot.send_message(user_id, "❌ Этот размер больше недоступен")
                 return
         
-        # Создаем заказ в БД
         order_id = db_actions.create_detailed_order(
             user_id=user_id,
             product_id=product_id,
@@ -537,16 +535,13 @@ def confirm_order(message):
         )
         
         if order_id:
-            # Если эксклюзивный товар, списываем BS Coin
             if product[10]:  # is_exclusive
                 db_actions.update_user_stats(user_id, 'bs_coin', -product[4])  # coin_price
             
             db_actions.update_user_stats(user_id, 'orders', 1)
             
-            # Отправляем уведомление админам в топик
             notify_admins_about_order(user_id, product, order_data, order_id, payment_photo_id)
             
-            # Убираем клавиатуру
             remove_markup = types.ReplyKeyboardRemove()
             
             bot.send_message(
@@ -1232,7 +1227,6 @@ def handle_order_now(call):
 
 @bot.message_handler(func=lambda message: message.text.startswith('/order_info_'))
 def order_info(message):
-    """Показывает детальную информацию о заказе"""
     user_id = message.from_user.id
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
@@ -1945,15 +1939,12 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
             print("❌ Не указан channel_id в конфиге")
             return False
         
-        # Формируем deep link
         deep_link = f"https://t.me/{bot.get_me().username}?start=product_{product_id}"
-        
-        # Создаем кнопку "Купить"
+
         markup = types.InlineKeyboardMarkup()
         buy_btn = types.InlineKeyboardButton("🛒 Купить", url=deep_link)
         markup.add(buy_btn)
         
-        # Формируем caption
         if not is_exclusive:
             price_text = f"💰 {product[3]}₽"  # product[3] - цена в рублях
         else:
@@ -1965,29 +1956,23 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
             f"👉 Нажмите «🛒 Купить» для заказа через бота"
         )
         
-        # Отправляем в канал
         if photos and len(photos) > 0:
-            # Если есть несколько фото, создаем медиагруппу
             if len(photos) > 1:
                 media = []
                 
-                # Первое фото с caption
                 media.append(types.InputMediaPhoto(
                     photos[0], 
                     caption=caption
                 ))
-                
-                # Остальные фото без caption
+
                 for photo in photos[1:]:
                     media.append(types.InputMediaPhoto(photo))
                 
-                # Отправляем медиагруппу
                 bot.send_media_group(
                     chat_id=channel_id,
                     media=media
                 )
                 
-                # Отдельно отправляем кнопку
                 bot.send_message(
                     chat_id=channel_id,
                     text="🛒 Для заказа нажмите кнопку ниже:",
@@ -1995,7 +1980,6 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
                 )
                 
             else:
-                # Если только одно фото
                 bot.send_photo(
                     chat_id=channel_id,
                     photo=photos[0],
@@ -2003,7 +1987,6 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
                     reply_markup=markup
                 )
         else:
-            # Если нет фото, отправляем текстовое сообщение
             bot.send_message(
                 chat_id=channel_id,
                 text=caption,
@@ -2452,12 +2435,10 @@ def process_payment_photo(message):
     user_id = message.from_user.id
     
     try:
-        # Сохраняем фото оплаты
         payment_photo_id = message.photo[-1].file_id
         temp_data[user_id]['order']['payment_photo'] = payment_photo_id
         temp_data[user_id]['order']['step'] = 'confirm_order'
         
-        # Показываем подтверждение с кнопками
         product_id = temp_data[user_id]['order']['product_id']
         product = db_actions.get_product(product_id)
         
@@ -2477,14 +2458,12 @@ def process_payment_photo(message):
                 f"Выберите действие:"
             )
             
-            # Создаем клавиатуру с кнопками
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
             confirm_btn = types.KeyboardButton("✅ Подтвердить")
             edit_btn = types.KeyboardButton("✏️ Редактировать данные")
             cancel_btn = types.KeyboardButton("❌ Отменить заказ")
             markup.add(confirm_btn, edit_btn, cancel_btn)
             
-            # Отправляем фото оплаты и информацию
             bot.send_photo(user_id, payment_photo_id, caption="📸 Ваше фото оплаты:")
             bot.send_message(user_id, order_summary, reply_markup=markup)
         
@@ -2512,19 +2491,16 @@ def process_delivery_info(message):
         phone = delivery_data[3].strip()
         delivery_type = delivery_data[4].strip()
         
-        # Проверяем тип доставки
         valid_delivery_types = ['почта россии', 'сдэк', 'почта', 'сдек']
         if delivery_type.lower() not in valid_delivery_types:
             bot.send_message(user_id, "❌ Укажите 'Почта России' или 'СДЭК' как способ доставки")
             return
-        
-        # Нормализуем тип доставки
+
         if delivery_type.lower() in ['почта россии', 'почта']:
             delivery_type = 'Почта России'
         else:
             delivery_type = 'СДЭК'
         
-        # Сохраняем данные доставки
         temp_data[user_id]['order'].update({
             'city': city,
             'address': address,
@@ -2534,7 +2510,6 @@ def process_delivery_info(message):
             'step': 'confirm_order'
         })
         
-        # Показываем подтверждение с кнопками
         product_id = temp_data[user_id]['order']['product_id']
         product = db_actions.get_product(product_id)
         
@@ -2556,7 +2531,6 @@ def process_delivery_info(message):
                 f"Выберите действие:"
             )
             
-            # Создаем клавиатуру с кнопками
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
             confirm_btn = types.KeyboardButton("✅ Подтвердить")
             edit_btn = types.KeyboardButton("✏️ Редактировать данные")
