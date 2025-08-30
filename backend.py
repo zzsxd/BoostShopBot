@@ -69,11 +69,23 @@ class DbAct:
         )
 
     def add_product(self, name, description, price, price_yuan, photo_id, category, is_exclusive=False, coin_price=0):
-        return self.__db.db_write(
-            '''INSERT INTO products (name, description, price, price_yuan, coin_price, photo_id, category, topic, is_exclusive) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (name, description, price, price_yuan, coin_price, photo_id, category, "магазин", is_exclusive)
-        )
+        try:
+            result = self.__db.db_write(
+                '''INSERT INTO products (name, description, price, price_yuan, coin_price, photo_id, category, topic, is_exclusive) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (name, description, price, price_yuan, coin_price, photo_id, category, "магазин", is_exclusive)
+            )
+            
+            if result:
+                # Получаем ID последней вставленной записи
+                last_id_data = self.__db.db_read('SELECT last_insert_rowid()')
+                if last_id_data:
+                    return last_id_data[0][0]
+            return None
+            
+        except Exception as e:
+            print(f"Ошибка добавления товара: {e}")
+            return None
 
     def get_products(self, category=None, limit=10):
         if category:
@@ -162,6 +174,9 @@ class DbAct:
     def import_products_from_excel(self, df):
         success_count = 0
         
+        # Сначала очищаем старые товары
+        self.clear_all_products()
+        
         grouped = df.groupby('Модель')
         
         for model_name, group in grouped:
@@ -188,6 +203,7 @@ class DbAct:
                 
                 print(f"Добавляем товар: {model_name}, цена: {price}, цена Y: {price_yuan}")
                 
+                # Добавляем товар в таблицу products
                 product_id = self.add_product(
                     name=str(model_name),
                     description=f"Модель: {model_name}",
@@ -212,11 +228,12 @@ class DbAct:
                             if not size:
                                 continue
                                 
+                            # Для каждой вариации используем правильный product_id
                             variation_price = get_safe_value(row, 'Цена', price)
                             variation_price_yuan = get_safe_value(row, 'Цена Y', price_yuan)
                             
                             self.add_product_variation(
-                                product_id=product_id,
+                                product_id=product_id,  # ← Используем текущий product_id
                                 model_id=model_id,
                                 size=size,
                                 quantity=quantity,
@@ -229,7 +246,7 @@ class DbAct:
                             print(f"Ошибка импорта вариации: {e}")
                             continue
                     
-                    print(f"Добавлено вариаций: {variation_count} для товара {model_name}")
+                    print(f"Добавлено вариаций: {variation_count} для товара {model_name} (ID: {product_id})")
                     success_count += 1
                 else:
                     print(f"Ошибка добавления товара: {model_name}")
@@ -244,12 +261,17 @@ class DbAct:
         return success_count
 
     def add_product_variation(self, product_id, model_id, size, quantity, price, price_yuan, link):
-        return self.__db.db_write(
-            '''INSERT INTO product_variations 
-            (product_id, model_id, size, quantity, price, price_yuan, link) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (product_id, model_id, size, quantity, price, price_yuan, link)
-        )
+        try:
+            result = self.__db.db_write(
+                '''INSERT INTO product_variations 
+                (product_id, model_id, size, quantity, price, price_yuan, link) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (product_id, model_id, size, quantity, price, price_yuan, link)
+            )
+            return bool(result)
+        except Exception as e:
+            print(f"Ошибка добавления вариации: {e}")
+            return False
 
     def get_product_with_variations(self, product_id):
         product = self.get_product(product_id)
