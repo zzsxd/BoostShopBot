@@ -145,21 +145,9 @@ class Bot_inline_btns:
 
     def order_now_button(self, product_id, size):
         markup = types.InlineKeyboardMarkup()
-        callback_data = f"order_now_{product_id}_{size}"
-        print(f"DEBUG: Creating order_now button with callback_data: {callback_data}")
-        
         btn = types.InlineKeyboardButton(
             text="🛒 Заказать сейчас",
-            callback_data=callback_data
-        )
-        markup.add(btn)
-        return markup
-
-    def review_buttons(self):
-        markup = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton(
-            text="✍️ Написать отзыв",
-            callback_data="start_review"
+            callback_data=f"order_{product_id}_{size}"
         )
         markup.add(btn)
         return markup
@@ -175,7 +163,6 @@ class Bot_inline_btns:
         return markup
     
     def create_order_status_buttons(order_id):
-        """Создает кнопки для управления статусом заказа"""
         markup = types.InlineKeyboardMarkup(row_width=2)
         
         buttons = [

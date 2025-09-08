@@ -36,34 +36,6 @@ channels = [
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
-def is_subscribed(user_id):
-    try:
-        for channel in channels:
-            member = bot.get_chat_member(chat_id=channel, user_id=user_id)
-            if member.status not in ['member', 'administrator', 'creator']:
-                return False
-        return True
-    except Exception as e:
-        print(f"Ошибка проверки подписки: {e}")
-        return False
-
-def show_subscription_request(user_id):
-    buttons = Bot_inline_btns()
-    markup = types.InlineKeyboardMarkup()
-    
-    for i, channel in enumerate(channels):
-        channel_btn = types.InlineKeyboardButton(f"📢 Канал {i+1}", url=f"https://t.me/{channel[1:]}")
-        markup.add(channel_btn)
-    
-    check_btn = types.InlineKeyboardButton("✅ Я ПОДПИСАЛСЯ", callback_data="check_subscription")
-    markup.add(check_btn)
-    
-    bot.send_message(
-        user_id,
-        "📢 Для использования бота, подпишитесь на наши каналы:",
-        reply_markup=markup
-    )
-
 def show_product(user_id, product_id):
     product = db_actions.get_product(product_id)
     if not product:
@@ -177,7 +149,6 @@ def ask_exclusive_status(user_id):
         reply_markup=markup
     )
 
-
 def process_products_file(message):
     user_id = message.from_user.id
     if not message.document:
@@ -194,8 +165,6 @@ def process_products_file(message):
         filename = f"products_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
         with open(filename, 'wb') as f:
             f.write(downloaded_file)
-        
-        import pandas as pd
         
         df = pd.read_excel(filename)
         
@@ -251,7 +220,6 @@ def process_products_file(message):
             os.remove(filename)
             return
     
-        
         success_count = db_actions.import_products_from_excel(df)
         
         total_products = len(df['Модель'].unique())
@@ -360,30 +328,52 @@ def publish_review_to_channel(user_id, review_data):
     except Exception as e:
         print(f"Ошибка публикации отзыва: {e}")
 
-def send_order_to_admin(user_id, delivery_info):
-    user_data = db_actions.get_user_data(user_id)
-    product_data = temp_data[user_id]
-    product = db_actions.get_product(product_data['selected_product'])
+def parse_delivery_info(text):
+    """Парсит данные доставки из текста"""
+    lines = text.strip().split('\n')
+    delivery_info = {
+        'city': '',
+        'address': '',
+        'full_name': '',
+        'phone': '',
+        'delivery_type': ''
+    }
     
-    order_text = (
-        f"🛒 Новый заказ\n\n"
-        f"👤 Пользователь: {user_data['first_name']} {user_data['last_name']}\n"
-        f"🔗 {user_data['username']}\n\n"
-        f"🛍️ Товар: {product[1]}\n"
-        f"📏 Размер: {product_data['selected_size']}\n"
-        f"💰 Цена: {product[3]}₽\n\n"
-        f"📦 Данные доставки:\n{delivery_info}\n\n"
-        f"🕒 Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    )
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if 'город:' in line.lower():
+            delivery_info['city'] = line.split(':', 1)[1].strip() if ':' in line else line
+        elif 'адрес:' in line.lower():
+            delivery_info['address'] = line.split(':', 1)[1].strip() if ':' in line else line
+        elif 'фио:' in line.lower() or 'фИО:' in line.lower():
+            delivery_info['full_name'] = line.split(':', 1)[1].strip() if ':' in line else line
+        elif 'телефон:' in line.lower():
+            delivery_info['phone'] = line.split(':', 1)[1].strip() if ':' in line else line
+        elif 'доставка:' in line.lower():
+            delivery_info['delivery_type'] = line.split(':', 1)[1].strip() if ':' in line else line
+        else:
+            # Попробуем определить по формату
+            if re.match(r'^\+?[78]?[ -]?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{2}[ -]?\d{2}$', line.replace(' ', '')):
+                delivery_info['phone'] = line
+            elif not delivery_info['city'] and len(line) < 50:
+                delivery_info['city'] = line
+            elif not delivery_info['address'] and len(line) > 10:
+                delivery_info['address'] = line
+            elif not delivery_info['full_name'] and len(line.split()) >= 2:
+                delivery_info['full_name'] = line
+            elif not delivery_info['delivery_type'] and any(x in line.lower() for x in ['почта', 'сдек', 'доставка']):
+                delivery_info['delivery_type'] = line
     
-    for admin_id in config.get_config()['admins']:
-        try:
-            bot.send_message(admin_id, order_text)
-        except:
-            pass
+    return delivery_info
 
 def notify_admins_about_order(user_id, product, order_data, order_id, payment_photo_id=None):
     try:
+        # ДОБАВЬТЕ ПРОВЕРКУ
+        print(f"DEBUG notify_admins_about_order - order_data keys: {list(order_data.keys())}")
+        
         user_data = db_actions.get_user_data(user_id)
         config_data = config.get_config()
         
@@ -395,14 +385,15 @@ def notify_admins_about_order(user_id, product, order_data, order_id, payment_ph
             f"🔗 {user_data['username']}\n"
             f"🆔 ID: {user_id}\n\n"
             f"🛍️ Товар: {product[1]}\n"
-            f"💰 Цена: {product[3]}₽\n"
+            f"📏 Размер: {order_data.get('size', 'Не указан')}\n"
+            f"💰 Цена: {product[4] if product[10] else product[3]} {'BS Coin' if product[10] else '₽'}\n"
             f"🎯 Тип: {'Эксклюзивный (BS Coin)' if product[10] else 'Обычный'}\n\n"
             f"📦 ДАННЫЕ ДОСТАВКИ:\n"
-            f"🏙️ Город: {order_data['city']}\n"
-            f"📍 Адрес: {order_data['address']}\n"
-            f"👤 ФИО: {order_data['full_name']}\n"
-            f"📞 Телефон: {order_data['phone']}\n"
-            f"🚚 Способ: {order_data['delivery_type']}\n\n"
+            f"🏙️ Город: {order_data.get('city', 'Не указан')}\n"
+            f"📍 Адрес: {order_data.get('address', 'Не указан')}\n"
+            f"👤 ФИО: {order_data.get('full_name', 'Не указан')}\n"
+            f"📞 Телефон: {order_data.get('phone', 'Не указан')}\n"
+            f"🚚 Способ: {order_data.get('delivery_type', 'Не указан')}\n\n"
             f"💳 ОПЛАТА: {'Приложена ✅' if payment_photo_id else 'Не приложена ❌'}\n\n"
             f"🕒 Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             f"📊 Статус: ⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ"
@@ -443,6 +434,8 @@ def notify_admins_about_order(user_id, product, order_data, order_id, payment_ph
                 
     except Exception as e:
         print(f"Ошибка в notify_admins_about_order: {e}")
+        import traceback
+        traceback.print_exc()
 
 def create_user_order_topic(user_data):
     """Создает топик для заказов пользователя и возвращает его ID"""
@@ -499,95 +492,77 @@ def close_order_topic(user_data, order_id, status="✅ ВЫПОЛНЕН"):
     except Exception as e:
         print(f"Ошибка закрытия топика: {e}")
 
-@bot.message_handler(func=lambda message: 
-    message.from_user.id in temp_data and 
-    temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
-    message.text.lower() == '✅ подтвердить')
-def confirm_order(message):
-    user_id = message.from_user.id
+# @bot.message_handler(func=lambda message: 
+#     message.from_user.id in temp_data and 
+#     temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
+#     message.text == '✅ Подтвердить заказ')
+# def confirm_order_final(message):
+#     user_id = message.from_user.id
     
-    try:
-        order_data = temp_data[user_id]['order']
-        product_id = order_data['product_id']
-        size = order_data.get('size')
-        product = db_actions.get_product(product_id)
-        payment_photo_id = order_data.get('payment_photo')
+#     try:
+#         order_data = temp_data[user_id]['order']
+#         product_id = order_data['product_id']
+#         product = db_actions.get_product(product_id)
         
-        if not product:
-            bot.send_message(user_id, "❌ Товар не найден")
-            return
+#         if not product:
+#             bot.send_message(user_id, "❌ Товар не найден")
+#             return
         
-        if size:
-            success = db_actions.decrease_product_quantity(product_id, size)
-            if not success:
-                bot.send_message(user_id, "❌ Этот размер больше недоступен")
-                return
+#         # ДОБАВЬТЕ ОТЛАДОЧНУЮ ПЕЧАТЬ
+#         print(f"DEBUG order_data keys: {list(order_data.keys())}")
+#         print(f"DEBUG order_data content: {order_data}")
         
-        order_id = db_actions.create_detailed_order(
-            user_id=user_id,
-            product_id=product_id,
-            size=size,
-            city=order_data['city'],
-            address=order_data['address'],
-            full_name=order_data['full_name'],
-            phone=order_data['phone'],
-            delivery_type=order_data['delivery_type']
-        )
+#         # Создаем заказ в базе
+#         order_id = db_actions.create_detailed_order(
+#             user_id=user_id,
+#             product_id=product_id,
+#             size=order_data.get('size'),
+#             city=order_data['city'],
+#             address=order_data['address'],
+#             full_name=order_data['full_name'], 
+#             phone=order_data['phone'],
+#             delivery_type=order_data['delivery_type']
+#         )
         
-        if order_id:
-            if product[10]:  # is_exclusive
-                db_actions.update_user_stats(user_id, 'bs_coin', -product[4])  # coin_price
+#         if order_id:
+#             # Уведомляем админов
+#             notify_admins_about_order(user_id, product, order_data, order_id, order_data.get('payment_photo'))
             
-            db_actions.update_user_stats(user_id, 'orders', 1)
+#             # Убираем клавиатуру
+#             remove_markup = types.ReplyKeyboardRemove()
             
-            notify_admins_about_order(user_id, product, order_data, order_id, payment_photo_id)
+#             bot.send_message(
+#                 user_id,
+#                 f"✅ Заказ #{order_id} оформлен!\n\n"
+#                 f"📞 С вами свяжутся в течение 15 минут для подтверждения.\n"
+#                 f"💬 Отслеживать статус заказа можно в этом чате.",
+#                 reply_markup=remove_markup
+#             )
             
-            remove_markup = types.ReplyKeyboardRemove()
+#             # Обновляем статистику пользователя
+#             db_actions.update_user_stats(user_id, 'orders', 1)
             
-            bot.send_message(
-                user_id,
-                f"✅ Заказ #{order_id} оформлен!\n\n"
-                f"📞 С вами свяжутся в течение 15 минут для подтверждения заказа.\n"
-                f"💬 Отслеживать статус заказа можно в этом чате.",
-                reply_markup=remove_markup
-            )
-        else:
-            bot.send_message(user_id, "❌ Ошибка оформления заказа")
+#             # Проверяем достижение первого заказа
+#             user_data = db_actions.get_user_data(user_id)
+#             if user_data and user_data['orders'] == 1:
+#                 db_actions.add_achievement(user_id, "first_order")
+#                 db_actions.update_user_stats(user_id, 'bs_coin', 50)
+#                 bot.send_message(
+#                     user_id,
+#                     "🎉 Вы получили достижение «Первый заказ» +50 BS Coin!"
+#                 )
+#         else:
+#             bot.send_message(user_id, "❌ Ошибка оформления заказа")
         
-    except Exception as e:
-        print(f"Ошибка подтверждения заказа: {e}")
-        bot.send_message(user_id, "❌ Ошибка оформления заказа")
-    finally:
-        if user_id in temp_data and 'order' in temp_data[user_id]:
-            del temp_data[user_id]['order']
-
-
-@bot.message_handler(func=lambda message: 
-    message.from_user.id in temp_data and 
-    temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
-    message.text.lower() == '✏️ редактировать данные')
-def edit_order_data(message):
-    user_id = message.from_user.id
-    
-    temp_data[user_id]['order']['step'] = 'ask_delivery'
-    remove_markup = types.ReplyKeyboardRemove()
-    bot.send_message(
-        user_id,
-        "📝 Редактирование данных доставки:\n\n"
-        "Пожалуйста, заполните данные доставки ОДНИМ сообщением в формате:\n\n"
-        "🏙️ Город: Ваш город\n"
-        "📍 Адрес: Улица, дом, квартира\n"
-        "👤 ФИО: Иванов Иван Иванович\n"
-        "📞 Телефон: +79123456789\n"
-        "🚚 Доставка: Почта России\n\n"
-        "Пример:\n"
-        "Москва\n"
-        "ул. Ленина, д. 10, кв. 5\n"
-        "Иванов Иван Иванович\n"
-        "+79123456789\n"
-        "Почта России", reply_markup=remove_markup
-    )
-    
+#     except Exception as e:
+#         print(f"Ошибка подтверждения заказа: {e}")
+#         import traceback
+#         traceback.print_exc()  # Добавьте эту строку для полной трассировки
+#         bot.send_message(user_id, "❌ Ошибка оформления заказа")
+#     finally:
+#         # Очищаем временные данные
+#         if user_id in temp_data and 'order' in temp_data[user_id]:
+#             del temp_data[user_id]['order']    
 
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
@@ -613,10 +588,6 @@ def cancel_order(message):
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
     
     buttons = Bot_inline_btns()
     
@@ -674,7 +645,7 @@ def start(message):
         f"🚀 Добро пожаловать на борт, Друг! 🚀\n"
         f"Рады приветствовать тебя в сообществе BridgeSide — месте, где встречаются твой стиль и уникальные возможности.\n\n"
         f"🌉 Твои мосты в мир BridgeSide: 🌉\n"
-        f"🛍️ @BridgeSide_Shop - Прямой каталог наших товаров. Здесь ты первым узнаешь о новинках и эксклюзивных дропах.\n"
+        f"🛍️ @BridgeSide_Shop - Прямой каталог наших товары. Здесь ты первым узнаешь о новинках и эксклюзивных дропах.\n"
         f"🌟 @BridgeSide_LifeStyle - Лукбуки, стиль, жизнь сообщества, акции и розыгрыши. Вдохновляйся и участвуй!\n"
         f"📢 @BridgeSide_Featback- Честные отзывы от таких же членов клуба, как и ты. Нам важна твоя оценка.\n\n"
         f"🤖 Как управлять этим кораблем? Проще простого!\n"
@@ -691,6 +662,26 @@ def start(message):
         bot.send_message(user_id, welcome_msg, reply_markup=buttons.admin_buttons())
     else:
         bot.send_message(user_id, welcome_msg, reply_markup=buttons.start_buttons())
+
+@bot.message_handler(commands=['test_button'])
+def test_button(message):
+    user_id = message.from_user.id
+    try:
+        markup = types.InlineKeyboardMarkup()
+        order_btn = types.InlineKeyboardButton(
+            text="🛒 Заказать сейчас",
+            callback_data="order_now_36_42.0"
+        )
+        markup.add(order_btn)
+        
+        bot.send_message(
+            user_id,
+            "Тестовая кнопка:",
+            reply_markup=markup
+        )
+        
+    except Exception as e:
+        bot.send_message(user_id, f"Ошибка теста: {e}")
 
 @bot.message_handler(func=lambda msg: msg.text == '👤 Мой профиль')
 def show_profile(message):
@@ -863,9 +854,6 @@ def user_info(message):
 @bot.message_handler(commands=['profile'])
 def profile(message):
     user_id = message.from_user.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
         
     user_data = db_actions.get_user_data(user_id)
     if not user_data:
@@ -905,9 +893,6 @@ def profile(message):
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
     user_id = message.from_user.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
         
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔ Эта команда только для администраторов")
@@ -1045,9 +1030,6 @@ def export_users(message):
 @bot.message_handler(commands=['exclusive'])
 def exclusive_products(message):
     user_id = message.from_user.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
         
     products = db_actions.get_exclusive_products(limit=10)
     buttons = Bot_inline_btns()
@@ -1111,13 +1093,17 @@ def order_status_command(message):
                 
                 status_display = status_texts.get(status.lower(), status.upper())
                 
-                bot.send_message(
-                    order_info['user_id'],
-                    f"📦 Статус вашего заказа #{order_id} изменен:\n"
-                    f"🔄 {status_display}\n\n"
-                    f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
-                    f"💰 Сумма: {product[3] if product else '0'}₽"
-                )
+                # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ
+                try:
+                    bot.send_message(
+                        order_info['user_id'],
+                        f"📦 Статус вашего заказа #{order_id} изменен:\n"
+                        f"🔄 {status_display}\n\n"
+                        f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
+                        f"💰 Сумма: {product[3] if product else '0'}₽"
+                    )
+                except Exception as e:
+                    print(f"Ошибка уведомления пользователя: {e}")
             
             bot.send_message(user_id, f"✅ Статус заказа #{order_id} изменен на '{status}'")
         else:
@@ -1127,7 +1113,6 @@ def order_status_command(message):
         bot.send_message(user_id, "❌ order_id должен быть числом")
     except Exception as e:
         bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
-
 
 @bot.message_handler(commands=['orders'])
 def list_orders(message):
@@ -1167,63 +1152,6 @@ def list_orders(message):
         )
     
     bot.send_message(user_id, orders_text)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('order_now_'))
-def handle_order_now(call):
-    try:
-        print(f"DEBUG: Order now callback: {call.data}")
-        
-        user_id = call.from_user.id
-        parts = call.data.split('_')
-        
-        if len(parts) < 4:
-            print(f"DEBUG: Неправильный формат - {call.data}")
-            bot.answer_callback_query(call.id, "❌ Ошибка формата")
-            return
-            
-        product_id = int(parts[2])
-        size = parts[3]
-        
-        print(f"DEBUG: Order now - product_id: {product_id}, size: '{size}' (type: {type(size)})")
-        
-        if not db_actions.check_size_availability(product_id, size):
-            bot.answer_callback_query(call.id, "❌ Этот размер недоступен")
-            return
-        
-        if user_id not in temp_data:
-            temp_data[user_id] = {}
-        
-        temp_data[user_id]['order'] = {
-            'product_id': product_id,
-            'size': size,
-            'step': 'ask_delivery'
-        }
-        
-        delivery_form = (
-            "📦 ДЛЯ ОФОРМЛЕНИЯ ЗАКАЗА\n\n"
-            "Пожалуйста, заполните данные доставки ОДНИМ сообщением в формате:\n\n"
-            "🏙️ Город: Ваш город\n"
-            "📍 Адрес: Улица, дом, квартира\n"
-            "👤 ФИО: Иванов Иван Иванович\n"
-            "📞 Телефон: +79123456789\n"
-            "🚚 Доставка: Почта России\n\n"
-            "Пример:\n"
-            "Москва\n"
-            "ул. Ленина, д. 10, кв. 5\n"
-            "Иванов Иван Иванович\n"
-            "+79123456789\n"
-            "Почта России"
-        )
-        
-        bot.send_message(user_id, delivery_form)
-        bot.answer_callback_query(call.id, "📝 Заполните данные доставки")
-        
-    except Exception as e:
-        print(f"Ошибка в order_now: {e}")
-        import traceback
-        traceback.print_exc()
-        bot.answer_callback_query(call.id, "❌ Ошибка оформления заказа")
 
 @bot.message_handler(func=lambda message: message.text.startswith('/order_info_'))
 def order_info(message):
@@ -1271,91 +1199,9 @@ def order_info(message):
     except Exception as e:
         bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('order_'))
-def handle_order_status_buttons(call):
-    """Обработка кнопок изменения статуса заказа"""
-    buttons = Bot_inline_btns()
-    try:
-        admin_id = call.from_user.id
-        if not db_actions.user_is_admin(admin_id):
-            bot.answer_callback_query(call.id, "⛔️ Недостаточно прав")
-            return
-            
-        parts = call.data.split('_')
-        action = parts[1]
-        order_id = int(parts[2])
-        
-        status_mapping = {
-            'confirm': 'confirmed',
-            'pay': 'paid',
-            'ship': 'shipped', 
-            'deliver': 'delivered',
-            'cancel': 'cancelled'
-        }
-        
-        if action in status_mapping:
-            new_status = status_mapping[action]
-            success = db_actions.update_order_status(order_id, new_status)
-            
-            if success:
-                order_info = db_actions.get_order_by_id(order_id)
-                if order_info:
-                    user_data = db_actions.get_user_data(order_info['user_id'])
-                    product = db_actions.get_product(order_info['product_id'])
-                    
-                    status_messages = {
-                        'confirmed': '✅ Ваш заказ подтвержден!',
-                        'paid': '💳 Заказ оплачен. Готовим к отправке!',
-                        'shipped': '🚚 Заказ отправлен! Трек-номер будет отправлен отдельно.',
-                        'delivered': '🎉 Заказ доставлен! Спасибо за покупку!',
-                        'cancelled': '❌ Заказ отменен. Если это ошибка, свяжитесь с поддержкой.'
-                    }
-                    
-                    bot.send_message(
-                        order_info['user_id'],
-                        f"{status_messages.get(new_status, 'Статус заказа изменен')}\n\n"
-                        f"🛒 Заказ #{order_id}\n"
-                        f"🛍️ {product[1] if product else 'Товар'}"
-                    )
-                
-                try:
-                    current_text = call.message.caption if call.message.caption else call.message.text
-                    updated_text = current_text.replace(
-                        "📊 Статус: ⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ",
-                        f"📊 Статус: {new_status.upper()}"
-                    )
-                    
-                    if call.message.photo:
-                        bot.edit_message_caption(
-                            chat_id=call.message.chat.id,
-                            message_id=call.message.message_id,
-                            caption=updated_text,
-                            reply_markup=buttons.create_order_status_buttons(order_id)
-                        )
-                    else:
-                        bot.edit_message_text(
-                            chat_id=call.message.chat.id,
-                            message_id=call.message.message_id,
-                            text=updated_text,
-                            reply_markup=buttons.create_order_status_buttons(order_id)
-                        )
-                except Exception as e:
-                    print(f"Ошибка обновления сообщения: {e}")
-                
-                bot.answer_callback_query(call.id, f"✅ Статус изменен на {new_status}")
-            else:
-                bot.answer_callback_query(call.id, "❌ Ошибка обновления статуса")
-                
-    except Exception as e:
-        print(f"Ошибка обработки кнопки статуса: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка обработки")
-
 @bot.message_handler(commands=['add_product'])
 def add_product(message):
     user_id = message.from_user.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
         
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "Эта команда только для администраторов")
@@ -1363,6 +1209,40 @@ def add_product(message):
         
     bot.send_message(user_id, "Отправьте фото товара")
     bot.register_next_step_handler(message, process_product_photo)
+
+@bot.message_handler(commands=['test_order'])
+def test_order(message):
+    user_id = message.from_user.id
+    try:
+        # Симулируем процесс заказа
+        temp_data[user_id] = {
+            'order': {
+                'product_id': 36,
+                'size': '42.0',
+                'step': 'ask_delivery'
+            }
+        }
+        
+        delivery_form = (
+            "📦 ДЛЯ ОФОРМЛЕНИЯ ЗАКАЗА\n\n"
+            "Пожалуйста, заполните данные доставки ОДНИМ сообщением в формате:\n\n"
+            "🏙️ Город: Ваш город\n"
+            "📍 Адрес: Улица, дом, квартира\n"
+            "👤 ФИО: Иванов Иван Иванович\n"
+            "📞 Телефон: +79123456789\n"
+            "🚚 Доставка: Почта России\n\n"
+            "Пример:\n"
+            "Москва\n"
+            "ул. Ленина, д. 10, кв. 5\n"
+            "Иванов Иван Иванович\n"
+            "+79123456789\n"
+            "Почта России"
+        )
+        
+        bot.send_message(user_id, delivery_form)
+        
+    except Exception as e:
+        bot.send_message(user_id, f"Ошибка теста: {e}")
 
 def process_product_photo(message):
     if not message.photo:
@@ -1421,15 +1301,6 @@ def process_product_price(message, photo_id, name, desc):
 
 # ============ ОБРАБОТЧИКИ CALLBACK ============
 
-@bot.callback_query_handler(func=lambda call: call.data == 'check_subscription')
-def check_subscription(call):
-    user_id = call.from_user.id
-    if is_subscribed(user_id):
-        bot.delete_message(user_id, call.message.message_id)
-        start(call.message)
-    else:
-        bot.answer_callback_query(call.id, "Вы ещё не подписались на канал")
-
 @bot.callback_query_handler(func=lambda call: call.data == 'exchange_coin')
 def exchange_coin(call):
     user_id = call.from_user.id
@@ -1482,10 +1353,7 @@ def exchange_coin(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('buy_coin_'))
 def buy_product_with_coins(call):
     user_id = call.from_user.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
-        
+
     try:
         product_id = int(call.data.split('_')[2])
     except (IndexError, ValueError):
@@ -1585,10 +1453,6 @@ def how_to_get_coins(call):
 @bot.callback_query_handler(func=lambda call: call.data == 'ref_link')
 def ref_link(call):
     user_id = call.message.chat.id
-    if not is_subscribed(user_id):
-        show_subscription_request(user_id)
-        return
-        
     user_data = db_actions.get_user_data(user_id)
     
     if not user_data:
@@ -1610,7 +1474,7 @@ def ref_link(call):
         f"Приглашайте друзей и получайте бонусы!\n\n"
         f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
         f"• За каждого приглашенного друга вы получаете 100 BS Coin\n"
-        f"• Ваш друг получает 50 BS Coin при первом заказе\n\n"
+        f"• Ваш друзья получает 50 BS Coin при первом заказе\n\n"
         f"🚀 Приглашено друзей: {ref_count}\n"
         f"💰 Заработано: {ref_count * 100} BS Coin"
     )
@@ -1855,8 +1719,6 @@ def handle_exclusive_post(call):
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
     temp_data[message.from_user.id].get('step') == 'ask_coin_price_post')
-
-
 def handle_coin_price_input(message):
     user_id = message.from_user.id
     
@@ -1940,57 +1802,40 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
             return False
         
         deep_link = f"https://t.me/{bot.get_me().username}?start=product_{product_id}"
-
-        markup = types.InlineKeyboardMarkup()
-        buy_btn = types.InlineKeyboardButton("🛒 Купить", url=deep_link)
-        markup.add(buy_btn)
         
         if not is_exclusive:
-            price_text = f"💰 {product[3]}₽"  # product[3] - цена в рублях
+            price_text = f"💰 Цена: {product[3]}₽"
         else:
-            price_text = f"💎 {coin_price} BS Coin"
+            price_text = f"💎 Цена: {coin_price} BS Coin"
         
         caption = (
             f"{text}\n\n"
             f"{price_text}\n\n"
-            f"👉 Нажмите «🛒 Купить» для заказа через бота"
+            f"👉 [Купить]({deep_link})"
         )
         
+        # Отправляем медиагруппу с фотографиями
         if photos and len(photos) > 0:
-            if len(photos) > 1:
-                media = []
-                
-                media.append(types.InputMediaPhoto(
-                    photos[0], 
-                    caption=caption
-                ))
+            media = []
+            
+            media.append(types.InputMediaPhoto(
+                photos[0], 
+                caption=caption,
+                parse_mode="Markdown"
+            ))
 
-                for photo in photos[1:]:
-                    media.append(types.InputMediaPhoto(photo))
-                
-                bot.send_media_group(
-                    chat_id=channel_id,
-                    media=media
-                )
-                
-                bot.send_message(
-                    chat_id=channel_id,
-                    text="🛒 Для заказа нажмите кнопку ниже:",
-                    reply_markup=markup
-                )
-                
-            else:
-                bot.send_photo(
-                    chat_id=channel_id,
-                    photo=photos[0],
-                    caption=caption,
-                    reply_markup=markup
-                )
+            for photo in photos[1:]:
+                media.append(types.InputMediaPhoto(photo))
+
+            bot.send_media_group(
+                chat_id=channel_id,
+                media=media
+            )
         else:
             bot.send_message(
                 chat_id=channel_id,
                 text=caption,
-                reply_markup=markup
+                parse_mode="Markdown"
             )
             
         return True
@@ -1998,49 +1843,769 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
     except Exception as e:
         print(f"Ошибка публикации в канал: {e}")
         return False
-    
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('buy_', 'order_now_')))
-def handle_buy(call):
-    user_id = call.from_user.id
-    
-    try:
-        if call.data.startswith('buy_coin_'):
-            parts = call.data.split('_')
-            product_id = int(parts[2])
-        else:
-            parts = call.data.split('_')
-            product_id = int(parts[1])
-            size = parts[3] if len(parts) > 3 else None
-        
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('size_', 'size_coin_')))
+def handle_size_selection(call):
+    user_id = call.from_user.id
+    try:
+        parts = call.data.split('_')
+        
+        is_exclusive = parts[0] == 'size_coin'
+        
+        if is_exclusive:
+            product_id = int(parts[2])
+            size = parts[3]
+        else:
+            product_id = int(parts[1])
+            size = parts[2]
+        
+        print(f"DEBUG: Выбран размер - product_id: {product_id}, size: '{size}', exclusive: {is_exclusive}")
+        
+        # Проверяем доступность размера
+        if not db_actions.check_size_availability(product_id, size):
+            bot.answer_callback_query(call.id, "❌ Этот размер недоступен")
+            return
+        
+        # Сохраняем выбор пользователя
+        if user_id not in temp_data:
+            temp_data[user_id] = {}
+        
+        temp_data[user_id]['selected_product'] = product_id
+        temp_data[user_id]['selected_size'] = size
+        temp_data[user_id]['is_exclusive'] = is_exclusive
+        
+        # Получаем информацию о товаре
+        product = db_actions.get_product(product_id)
+        if not product:
+            bot.answer_callback_query(call.id, "❌ Товар не найден")
+            return
+        
+        # Создаем кнопку в зависимости от типа товара
+        markup = types.InlineKeyboardMarkup()
+        
+        if is_exclusive:
+            # Для эксклюзивных товаров - кнопка покупки за BS Coin
+            user_data = db_actions.get_user_data(user_id)
+            if user_data and user_data['bs_coin'] >= product[4]:
+                buy_btn = types.InlineKeyboardButton(
+                    text=f"💎 Купить за {product[4]} BS Coin",
+                    callback_data=f"buy_coin_{product_id}_{size}"
+                )
+                markup.add(buy_btn)
+            else:
+                buy_btn = types.InlineKeyboardButton(
+                    text=f"❌ Недостаточно BS Coin",
+                    callback_data="how_to_get_coins"
+                )
+                markup.add(buy_btn)
+        else:
+            # Для обычных товаров - кнопка "Заказать сейчас"
+            order_btn = types.InlineKeyboardButton(
+                text="🛒 Заказать сейчас",
+                callback_data=f"order_{product_id}_{size}"
+            )
+            markup.add(order_btn)
+        
+        # Обновляем сообщение
+        try:
+            if call.message.caption:
+                bot.edit_message_caption(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    caption=call.message.caption,
+                    reply_markup=markup
+                )
+            else:
+                bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    text=call.message.text,
+                    reply_markup=markup
+                )
+            
+            bot.answer_callback_query(call.id, f"✅ Выбран размер: {size}")
+            
+        except Exception as e:
+            print(f"Ошибка редактирования: {e}")
+            bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
+                
+    except Exception as e:
+        print(f"Ошибка в handle_size_selection: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('order_'))
+def handle_order(call):
+    user_id = call.from_user.id
+    try:
+        parts = call.data.split('_')
+        product_id = int(parts[1])
+        size = parts[2] if len(parts) > 2 else None
+        
+        print(f"DEBUG: Оформление заказа - product_id: {product_id}, size: {size}")
+        
+        # Сохраняем данные заказа
         if user_id not in temp_data:
             temp_data[user_id] = {}
         
         temp_data[user_id]['order'] = {
             'product_id': product_id,
-            'step': 'ask_delivery'
+            'size': size,
+            'step': 'ask_city'
         }
-        
 
-        delivery_form = (
-            "📦 ДЛЯ ОФОРМЛЕНИЯ ЗАКАЗА\n\n"
+        # Начинаем процесс заполнения данных доставки
+        bot.send_message(
+            user_id,
+            "📦 ОФОРМЛЕНИЕ ЗАКАЗА\n\n"
             "Пожалуйста, заполните данные доставки:\n\n"
-            "🏙️ Город:\n"
-            "📍 Полный адрес (улица, дом, квартира):\n"
-            "👤 ФИО получателя:\n"
-            "📞 Номер телефона:\n"
-            "🚚 Предпочтительный способ доставки (Почта России/СДЭК):\n\n"
-            "Отправьте все данные ОДНИМ сообщением в указанном порядке."
+            "🏙️ Введите ваш город:"
         )
-        
-        bot.send_message(user_id, delivery_form)
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "📝 Заполните данные доставки")
         
     except Exception as e:
-        print(f"Ошибка обработки покупки: {e}")
+        print(f"Ошибка в handle_order: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка оформления заказа")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_order_', 'reject_order_')))
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_city')
+def ask_city(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['city'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_address'
+    bot.send_message(user_id, "📍 Введите полный адрес (улица, дом, квартира):")
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_address')
+def ask_address(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['address'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_full_name'
+    bot.send_message(user_id, "👤 Введите ФИО получателя:")
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_full_name')
+def ask_full_name(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['full_name'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_phone'
+    bot.send_message(user_id, "📞 Введите номер телефона:")
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_phone')
+def ask_phone(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['phone'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_delivery_type'
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("Почта России"))
+    markup.add(types.KeyboardButton("СДЭК"))
+    markup.add(types.KeyboardButton("Другое"))
+    
+    bot.send_message(user_id, "🚚 Выберите способ доставки:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_delivery_type')
+def ask_delivery_type(message):
+    user_id = message.from_user.id
+    
+    # Если выбрано "Другое", переходим к специальной обработке
+    if message.text == "Другое":
+        handle_other_delivery(message)
+        return
+    
+    # Убираем клавиатуру
+    remove_markup = types.ReplyKeyboardRemove()
+    
+    temp_data[user_id]['order']['delivery_type'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_payment'
+    
+    # Получаем информацию о товаре
+    product_id = temp_data[user_id]['order']['product_id']
+    product = db_actions.get_product(product_id)
+    
+    if product:
+        price = product[4] if product[10] else product[3]
+        currency = 'BS Coin' if product[10] else '₽'
+        
+        # Показываем сводку по заказу
+        order_summary = (
+            f"✅ Данные доставки получены!\n\n"
+            f"📋 Ваш заказ:\n"
+            f"🛍️ Товар: {product[1]}\n"
+            f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
+            f"💰 Цена: {price} {currency}\n\n"
+            f"📦 Доставка:\n"
+            f"🏙️ Город: {temp_data[user_id]['order']['city']}\n"
+            f"📍 Адрес: {temp_data[user_id]['order']['address']}\n"
+            f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
+            f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
+            f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
+            f"💳 Теперь отправьте скриншот чека об оплате"
+        )
+        
+        bot.send_message(user_id, order_summary, reply_markup=remove_markup)
+
+@bot.message_handler(content_types=['photo'], 
+                    func=lambda message: 
+                    message.from_user.id in temp_data and 
+                    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_payment')
+def process_payment_photo(message):
+    user_id = message.from_user.id
+    
+    try:
+        # Сохраняем фото оплаты
+        payment_photo_id = message.photo[-1].file_id
+        temp_data[user_id]['order']['payment_photo'] = payment_photo_id
+        temp_data[user_id]['order']['step'] = 'confirm_order'
+        
+        # Получаем информацию о товаре
+        product_id = temp_data[user_id]['order']['product_id']
+        product = db_actions.get_product(product_id)
+        
+        if product:
+            price = product[4] if product[10] else product[3]
+            currency = 'BS Coin' if product[10] else '₽'
+            
+            order_summary = (
+                f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
+                f"📋 Ваш заказ:\n"
+                f"🛍️ Товар: {product[1]}\n"
+                f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
+                f"💰 Цена: {price} {currency}\n\n"
+                f"📦 Доставка:\n"
+                f"🏙️ Город: {temp_data[user_id]['order']['city']}\n"
+                f"📍 Адрес: {temp_data[user_id]['order']['address']}\n"
+                f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
+                f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
+                f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
+                f"📸 Фото оплаты приложено\n\n"
+                f"Выберите действие:"
+            )
+            
+            # Клавиатура подтверждения
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            confirm_btn = types.KeyboardButton("✅ Подтвердить заказ")
+            edit_btn = types.KeyboardButton("✏️ Редактировать данные")
+            cancel_btn = types.KeyboardButton("❌ Отменить заказ")
+            markup.add(confirm_btn, edit_btn, cancel_btn)
+            
+            # Отправляем фото и описание
+            bot.send_photo(user_id, payment_photo_id, caption="📸 Ваше фото оплаты:")
+            bot.send_message(user_id, order_summary, reply_markup=markup)
+        
+    except Exception as e:
+        print(f"Ошибка обработки фото: {e}")
+        bot.send_message(user_id, "❌ Ошибка обработки фото")
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
+    message.text == '✅ Подтвердить заказ')
+def confirm_order_final(message):
+    user_id = message.from_user.id
+    
+    try:
+        order_data = temp_data[user_id]['order']
+        product_id = order_data['product_id']
+        product = db_actions.get_product(product_id)
+        
+        if not product:
+            bot.send_message(user_id, "❌ Товар не найден")
+            return
+        
+        # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
+        print(f"DEBUG: Подтверждение заказа - user_id: {user_id}, product_id: {product_id}")
+        print(f"DEBUG: Данные заказа: {order_data}")
+        
+        # Создаем заказ в базе
+        order_id = db_actions.create_detailed_order(
+            user_id=user_id,  # Убедитесь что передается правильный user_id
+            product_id=product_id,
+            size=order_data.get('size'),
+            city=order_data['city'],
+            address=order_data['address'],
+            full_name=order_data['full_name'], 
+            phone=order_data['phone'],
+            delivery_type=order_data['delivery_type']
+        )
+        
+        print(f"DEBUG: Создан заказ ID: {order_id}")
+        
+        if order_id:
+            # Уведомляем админов
+            notify_admins_about_order(user_id, product, order_data, order_id, order_data.get('payment_photo'))
+            
+            # Убираем клавиатуру
+            remove_markup = types.ReplyKeyboardRemove()
+            
+            bot.send_message(
+                user_id,
+                f"✅ Заказ #{order_id} оформлен!\n\n"
+                f"📞 С вами свяжутся в течение 15 минут для подтверждения.\n"
+                f"💬 Отслеживать статус заказа можно в этом чате.",
+                reply_markup=remove_markup
+            )
+            
+            # Обновляем статистику пользователя
+            db_actions.update_user_stats(user_id, 'orders', 1)
+            
+            # Проверяем достижение первого заказа
+            user_data = db_actions.get_user_data(user_id)
+            if user_data and user_data['orders'] == 1:
+                db_actions.add_achievement(user_id, "first_order")
+                db_actions.update_user_stats(user_id, 'bs_coin', 50)
+                bot.send_message(
+                    user_id,
+                    "🎉 Вы получили достижение «Первый заказ» +50 BS Coin!"
+                )
+        else:
+            bot.send_message(user_id, "❌ Ошибка оформления заказа")
+        
+    except Exception as e:
+        print(f"Ошибка подтверждения заказа: {e}")
+        import traceback
+        traceback.print_exc()
+        bot.send_message(user_id, "❌ Ошибка оформления заказа")
+    finally:
+        # Очищаем временные данные
+        if user_id in temp_data and 'order' in temp_data[user_id]:
+            del temp_data[user_id]['order']
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
+    message.text.lower() == '✏️ редактировать данные')
+def edit_order_data(message):
+    user_id = message.from_user.id
+    
+    # Предлагаем выбрать, какие данные редактировать
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    
+    bot.send_message(
+        user_id,
+        "📝 Что хотите отредактировать?",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_choice')
+def handle_edit_choice(message):
+    user_id = message.from_user.id
+    choice = message.text
+    
+    if choice == "✅ Все верно":
+        temp_data[user_id]['order']['step'] = 'confirm_order'
+        show_order_confirmation(user_id)
+        return
+    
+    if choice == "🏙️ Город":
+        temp_data[user_id]['order']['step'] = 'edit_city'
+        bot.send_message(user_id, "🏙️ Введите новый город:", reply_markup=types.ReplyKeyboardRemove())
+    elif choice == "📍 Адрес":
+        temp_data[user_id]['order']['step'] = 'edit_address'
+        bot.send_message(user_id, "📍 Введите новый адрес:", reply_markup=types.ReplyKeyboardRemove())
+    elif choice == "👤 ФИО":
+        temp_data[user_id]['order']['step'] = 'edit_full_name'
+        bot.send_message(user_id, "👤 Введите новое ФИО:", reply_markup=types.ReplyKeyboardRemove())
+    elif choice == "📞 Телефон":
+        temp_data[user_id]['order']['step'] = 'edit_phone'
+        bot.send_message(user_id, "📞 Введите новый телефон:", reply_markup=types.ReplyKeyboardRemove())
+    elif choice == "🚚 Способ доставки":
+        temp_data[user_id]['order']['step'] = 'edit_delivery_type'
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(types.KeyboardButton("Почта России"))
+        markup.add(types.KeyboardButton("СДЭК"))
+        markup.add(types.KeyboardButton("Другое"))
+        bot.send_message(user_id, "🚚 Выберите способ доставки:", reply_markup=markup)
+    elif choice == "📸 Фото оплаты":
+        temp_data[user_id]['order']['step'] = 'edit_payment'
+        bot.send_message(user_id, "📸 Отправьте новое фото оплаты:", reply_markup=types.ReplyKeyboardRemove())
+
+def show_order_confirmation(user_id):
+    """Показывает подтверждение заказа с кнопками"""
+    product_id = temp_data[user_id]['order']['product_id']
+    product = db_actions.get_product(product_id)
+    
+    if product:
+        price = product[4] if product[10] else product[3]
+        currency = 'BS Coin' if product[10] else '₽'
+        
+        order_summary = (
+            f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
+            f"📋 Ваш заказ:\n"
+            f"🛍️ Товар: {product[1]}\n"
+            f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
+            f"💰 Цена: {price} {currency}\n\n"
+            f"📦 Доставка:\n"
+            f"🏙️ Город: {temp_data[user_id]['order']['city']}\n"
+            f"📍 Адрес: {temp_data[user_id]['order']['address']}\n"
+            f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
+            f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
+            f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
+            f"📸 Фото оплаты: {'Приложено ✅' if temp_data[user_id]['order'].get('payment_photo') else 'Не приложено ❌'}\n\n"
+            f"Выберите действие:"
+        )
+        
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        confirm_btn = types.KeyboardButton("✅ Подтвердить заказ")
+        edit_btn = types.KeyboardButton("✏️ Редактировать данные")
+        cancel_btn = types.KeyboardButton("❌ Отменить заказ")
+        markup.add(confirm_btn, edit_btn, cancel_btn)
+        
+        bot.send_message(user_id, order_summary, reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_city')
+def edit_city(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['city'] = message.text
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ Город обновлен! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_address')
+def edit_address(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['address'] = message.text
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ Адрес обновлен! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_full_name')
+def edit_full_name(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['full_name'] = message.text
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ ФИО обновлено! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_phone')
+def edit_phone(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['phone'] = message.text
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ Телефон обновлен! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_delivery_type')
+def edit_delivery_type(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['delivery_type'] = message.text
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ Способ доставки обновлен! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(content_types=['photo'], 
+                    func=lambda message: 
+                    message.from_user.id in temp_data and 
+                    temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_payment')
+def edit_payment(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['payment_photo'] = message.photo[-1].file_id
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🏙️ Город"),
+        types.KeyboardButton("📍 Адрес"),
+        types.KeyboardButton("👤 ФИО"),
+        types.KeyboardButton("📞 Телефон"),
+        types.KeyboardButton("🚚 Способ доставки"),
+        types.KeyboardButton("📸 Фото оплаты"),
+        types.KeyboardButton("✅ Все верно")
+    )
+    
+    temp_data[user_id]['order']['step'] = 'edit_choice'
+    bot.send_message(user_id, "✅ Фото оплаты обновлено! Что еще хотите отредактировать?", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'confirm_order' and
+    message.text.lower() == '❌ отменить заказ')
+def cancel_order(message):
+    user_id = message.from_user.id
+    
+    if user_id in temp_data and 'order' in temp_data[user_id]:
+        del temp_data[user_id]['order']
+    
+    remove_markup = types.ReplyKeyboardRemove()
+    
+    bot.send_message(
+        user_id,
+        "❌ Заказ отменен.\n\n"
+        "Если передумаете - всегда можете оформить новый заказ!",
+        reply_markup=remove_markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_review_', 'reject_review_')))
+def handle_review_moderation(call):
+    try:
+        parts = call.data.split('_')
+        action = parts[0]
+        user_id = int(parts[2])
+        
+        review_key = None
+        review_data = None
+        
+        for key in list(pending_reviews.keys()):
+            if key.startswith(f"{user_id}_"):
+                review_key = key
+                review_data = pending_reviews[key]
+                break
+        
+        if not review_data:
+            bot.answer_callback_query(call.id, "❌ Данные отзыва не найдены или устарели")
+            return
+            
+        if action == 'approve':
+            photos_json = json.dumps(review_data.get('photos', [])) if review_data.get('photos') else None
+            db_actions.add_review(
+                user_id, 
+                review_data['text'], 
+                photos_json
+            )
+            
+            publish_review_to_channel(user_id, review_data)
+            
+            bot.answer_callback_query(call.id, "✅ Отзыв одобрен")
+            bot.send_message(
+                user_id,
+                "🎉 Ваш отзыв одобрен и опубликован в @BridgeSide_Featback!"
+            )
+            
+        else:
+            bot.answer_callback_query(call.id, "❌ Отзыв отклонен")
+            bot.send_message(
+                user_id,
+                "❌ Ваш отзыв не прошел модерацию. Пожалуйста, проверьте его и отправьте еще раз."
+            )
+            
+    except Exception as e:
+        print(f"Ошибка в модерации: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка при обработке")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'start_review')
+def start_review(call):
+    user_id = call.from_user.id
+    
+    if user_id not in temp_data:
+        temp_data[user_id] = {}
+    
+    temp_data[user_id]['step'] = 'writing_review'
+    temp_data[user_id]['photos'] = []
+    
+    bot.send_message(
+        user_id,
+        "📝 Напишите ваш отзыв. Вы можете:\n"
+        "• Написать текст отзыва\n"
+        "• Прикрепить до 3 фотографий\n"
+        "• Отправить /done для завершения\n"
+        "• Отправить /cancel для отмены"
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reject_order_'))
+def handle_order_rejection(call):
+    try:
+        admin_id = call.from_user.id
+        if not db_actions.user_is_admin(admin_id):
+            bot.answer_callback_query(call.id, "⛔️ Недостаточно прав")
+            return
+            
+        order_id = int(call.data.split('_')[2])
+        
+        order_info = db_actions.get_order_by_id(order_id)
+        if not order_info:
+            bot.answer_callback_query(call.id, "❌ Заказ не найден")
+            return
+            
+        db_actions.return_product_quantity(order_id)
+            
+        user_data = db_actions.get_user_data(order_info['user_id'])
+        product = db_actions.get_product(order_info['product_id'])
+        
+        temp_data[admin_id] = {
+            'reject_order': {
+                'order_id': order_id,
+                'message_id': call.message.message_id,
+                'chat_id': call.message.chat.id,
+                'is_photo': call.message.photo is not None,
+                'topic_id': call.message.message_thread_id
+            }
+        }
+        
+        bot.answer_callback_query(
+            call.id, 
+            "💬 Ответьте в топике на сообщение с заказом текстом причины отклонения", 
+            show_alert=True
+        )
+            
+    except Exception as e:
+        print(f"Ошибка обработки отклонения заказа: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка обработки")
+
+
+@bot.message_handler(func=lambda message: message.reply_to_message and message.reply_to_message.text and "ЗАКАЗ #" in message.reply_to_message.text)
+def handle_topic_reply(message):
+    try:
+        admin_id = message.from_user.id
+        if not db_actions.user_is_admin(admin_id):
+            return
+            
+        replied_message = message.reply_to_message
+        replied_text = replied_message.text if replied_message.text else replied_message.caption
+
+        import re
+        order_id_match = re.search(r'ЗАКАЗ #(\d+)', replied_text)
+        if not order_id_match:
+            return
+            
+        order_id = int(order_id_match.group(1))
+        reason = message.text
+        
+        db_actions.return_product_quantity(order_id)
+        
+        db_actions.update_order_status(order_id, f"❌ ОТКЛОНЕН: {reason}")
+        
+        order_info = db_actions.get_order_by_id(order_id)
+        if not order_info:
+            return
+            
+        user_data = db_actions.get_user_data(order_info['user_id'])
+        product = db_actions.get_product(order_info['product_id'])
+        
+        try:
+            if replied_message.caption:
+                new_caption = replied_message.caption.replace("⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", f"❌ ОТКЛОНЕН: {reason}")
+                bot.edit_message_caption(
+                    chat_id=replied_message.chat.id,
+                    message_id=replied_message.message_id,
+                    caption=new_caption,
+                    message_thread_id=replied_message.message_thread_id,
+                    reply_markup=None
+                )
+            else:
+                new_text = replied_message.text.replace("⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", f"❌ ОТКЛОНЕН: {reason}")
+                bot.edit_message_text(
+                    chat_id=replied_message.chat.id,
+                    message_id=replied_message.message_id,
+                    text=new_text,
+                    message_thread_id=replied_message.message_thread_id,
+                    reply_markup=None
+                )
+        except Exception as e:
+            print(f"Ошибка обновления сообщения: {e}")
+        
+        try:
+            bot.send_message(
+                order_info['user_id'],
+                f"❌ Ваш заказ #{order_id} отклонен\n\n"
+                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
+                f"📝 Причина: {reason}\n\n"
+                f"💬 Если у вас есть вопросы, обратитесь в поддержку."
+            )
+            
+            if product and product[10]:
+                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', product[4])
+                bot.send_message(
+                    order_info['user_id'],
+                    f"💎 Вам возвращено {product[4]} BS Coin"
+                )
+        except Exception as e:
+            print(f"Ошибка уведомления пользователя: {e}")
+        
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except:
+            pass
+
+            
+    except Exception as e:
+        print(f"Ошибка обработки ответа в топике: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('approve_order_'))
 def handle_order_approval(call):
     try:
         admin_id = call.from_user.id
@@ -2048,94 +2613,82 @@ def handle_order_approval(call):
             bot.answer_callback_query(call.id, "⛔️ Недостаточно прав")
             return
             
-        action = call.data.split('_')[0]
         order_id = int(call.data.split('_')[2])
         
-        order_data = db_actions.get_order_by_id(order_id)
-        if not order_data:
+        order_info = db_actions.get_order_by_id(order_id)
+        if not order_info:
             bot.answer_callback_query(call.id, "❌ Заказ не найден")
             return
-            
-        user_data = db_actions.get_user_data(order_data['user_id'])
-        product = db_actions.get_product(order_data['product_id'])
-        
-        if action == 'approve':
 
-            db_actions.update_order_status(order_id, "✅ ПОДТВЕРЖДЕН")
-            
-
-            current_text = call.message.caption if call.message.caption else call.message.text
-            updated_text = f"{current_text}\n\n📊 Статус: ✅ ПОДТВЕРЖДЕН\n👨‍💼 Подтвердил: @{call.from_user.username}"
+        if order_info['user_id'] == admin_id:
+            print(f"❌ ВНИМАНИЕ: order_info user_id совпадает с admin_id! Ищем последний заказ...")
             
             try:
-                if call.message.photo:
-                    bot.edit_message_caption(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        caption=updated_text,
-                        reply_markup=None
-                    )
-                else:
-                    bot.edit_message_text(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        text=updated_text,
-                        reply_markup=None
-                    )
+                all_orders = db_actions._DbAct__db.db_read(
+                    'SELECT order_id, user_id FROM orders_detailed ORDER BY order_id DESC LIMIT 5'
+                )
+                print(f"DEBUG: Последние заказы: {all_orders}")
+                
+                for order in all_orders:
+                    if order[1] != admin_id:
+                        order_info = db_actions.get_order_by_id(order[0])
+                        print(f"DEBUG: Используем заказ: {order[0]} с user_id: {order[1]}")
+                        break
+                
             except Exception as e:
-                print(f"Ошибка редактирования сообщения: {e}")
-            
+                print(f"Ошибка поиска последних заказов: {e}")
+        
 
+        if order_info['user_id'] == admin_id:
+            bot.answer_callback_query(call.id, "❌ Ошибка: неверный заказ")
+            return
+            
+        user_data = db_actions.get_user_data(order_info['user_id'])
+        product = db_actions.get_product(order_info['product_id'])
+        
+
+        db_actions.update_order_status(order_id, "✅ ПОДТВЕРЖДЕН")
+
+
+        try:
+            if call.message.caption:
+                new_caption = call.message.caption.replace("⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "✅ ПОДТВЕРЖДЕН")
+                bot.edit_message_caption(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    caption=new_caption,
+                    reply_markup=None
+                )
+            else:
+                new_text = call.message.text.replace("⏳ ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "✅ ПОДТВЕРЖДЕН")
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=new_text,
+                    reply_markup=None
+                )
+        except Exception as e:
+            print(f"Ошибка обновления сообщения: {e}")
+        
+        try:
             bot.send_message(
-                order_data['user_id'],
+                order_info['user_id'],
                 f"🎉 Ваш заказ #{order_id} подтвержден!\n\n"
-                f"🛍️ Товар: {product[1]}\n"
-                f"💰 Сумма: {product[3]}₽\n\n"
+                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
                 f"📦 Заказ передан в обработку. Ожидайте информацию о доставке."
             )
-            
-            bot.answer_callback_query(call.id, "✅ Заказ подтвержден")
-            
-        else:
+        except Exception as e:
+            print(f"Ошибка уведомления пользователя: {e}")
         
-            markup = types.InlineKeyboardMarkup()
-            reason_btn = types.InlineKeyboardButton(
-                "📝 Указать причину отклонения", 
-                callback_data=f"reject_reason_{order_id}"
-            )
-            markup.add(reason_btn)
-            
-
-            current_text = call.message.caption if call.message.caption else call.message.text
-            updated_text = f"{current_text}\n\n📊 Статус: ❌ ОТКЛОНЕН (укажите причину)\n👨‍💼 Отклонил: @{call.from_user.username}"
-            
-            try:
-                if call.message.photo:
-                    bot.edit_message_caption(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        caption=updated_text,
-                        reply_markup=markup
-                    )
-                else:
-                    bot.edit_message_text(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        text=updated_text,
-                        reply_markup=markup
-                    )
-            except Exception as e:
-                print(f"Ошибка редактирования сообщения: {e}")
-            
-            bot.answer_callback_query(call.id, "📝 Укажите причину в топике")
-            
+        bot.answer_callback_query(call.id, "✅ Заказ подтвержден")
+        
     except Exception as e:
         print(f"Ошибка обработки подтверждения заказа: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка обработки")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('reject_reason_'))
 def ask_reject_reason(call):
-    """Запрос причины отклонения в топике"""
     try:
         order_id = int(call.data.split('_')[2])
         
@@ -2148,87 +2701,11 @@ def ask_reject_reason(call):
     except Exception as e:
         print(f"Ошибка запроса причины: {e}")
 
-@bot.message_handler(func=lambda message: message.reply_to_message)
-def handle_reply_in_topic(message):
-
-    try:
-        replied_message = message.reply_to_message
-        
-
-        replied_text = ""
-        if replied_message.caption:
-            replied_text = replied_message.caption
-        elif replied_message.text:
-            replied_text = replied_message.text
-        else:
-
-            return
-        
-
-        if replied_text and "ЗАКАЗ #" in replied_text and "❌ ОТКЛОНЕН" in replied_text:
-
-            import re
-            order_id_match = re.search(r'ЗАКАЗ #(\d+)', replied_text)
-            if order_id_match:
-                order_id = int(order_id_match.group(1))
-                reason = message.text
-                
-
-                db_actions.update_order_status(order_id, f"❌ ОТКЛОНЕН: {reason}")
-                
-
-                order_info = db_actions.get_order_by_id(order_id)
-                if order_info:
-                    user_data = db_actions.get_user_data(order_info['user_id'])
-                    product = db_actions.get_product(order_info['product_id'])
-                    
-
-                    if user_data and product:
-                        try:
-                            bot.send_message(
-                                order_info['user_id'],
-                                f"❌ Ваш заказ #{order_id} отклонен\n\n"
-                                f"🛍️ Товар: {product[1]}\n"
-                                f"💰 Сумма: {product[3]}₽\n\n"
-                                f"📝 Причина: {reason}\n\n"
-                                f"💬 Если у вас есть вопросы, обратитесь в поддержку."
-                            )
-                            
-
-                            if product[10]:
-                                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', product[4])
-                                bot.send_message(
-                                    order_info['user_id'],
-                                    f"💎 Вам возвращено {product[4]} BS Coin"
-                                )
-                        except Exception as e:
-                            print(f"Ошибка уведомления пользователя: {e}")
-                
-
-                try:
-                    bot.delete_message(message.chat.id, message.message_id)
-                except:
-                    pass
-                
-
-                try:
-                    bot.send_message(
-                        message.chat.id,
-                        f"✅ Причина отклонения заказа #{order_id} сохранена",
-                        reply_to_message_id=replied_message.message_id
-                    )
-                except:
-                    pass
-                
-    except Exception as e:
-        print(f"Ошибка обработки ответа: {e}")
-
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
     'reject_reason' in temp_data[message.from_user.id] and
     message.chat.id == temp_data[message.from_user.id]['reject_reason']['chat_id'])
 def process_reject_reason_in_topic(message):
-    """Обработка причины отклонения в топике"""
     try:
         admin_id = message.from_user.id
         reason_data = temp_data[admin_id]['reject_reason']
@@ -2318,114 +2795,151 @@ def process_reject_reason_in_topic(message):
 
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
-    'reject_order' in temp_data[message.from_user.id])
-def handle_reject_reason(message):
-    """Обработка причины отклонения заказа"""
-    try:
-        admin_id = message.from_user.id
-        order_data = temp_data[admin_id]['reject_order']
-        order_id = order_data['order_id']
-        
-        reason = message.text
-        order_info = db_actions.get_order_by_id(order_id)
-        user_data = db_actions.get_user_data(order_info['user_id'])
-        product = db_actions.get_product(order_info['product_id'])
-        
-        try:
-            if order_data['is_photo']:
-                msg_info = bot.get_message(order_data['chat_id'], order_data['message_id'])
-                current_text = msg_info.caption
-            else:
-                msg_info = bot.get_message(order_data['chat_id'], order_data['message_id'])
-                current_text = msg_info.text
-        except:
-            current_text = "Информация о заказе"
-        
-        updated_text = f"{current_text}\n\n📊 Статус: ❌ ОТКЛОНЕН\n📝 Причина: {reason}\n👨‍💼 Отклонил: @{message.from_user.username}"
-        
-        try:
-            if order_data['is_photo']:
-                bot.edit_message_caption(
-                    chat_id=order_data['chat_id'],
-                    message_id=order_data['message_id'],
-                    caption=updated_text,
-                    reply_markup=None
-                )
-            else:
-                bot.edit_message_text(
-                    chat_id=order_data['chat_id'],
-                    message_id=order_data['message_id'],
-                    text=updated_text,
-                    reply_markup=None
-                )
-        except Exception as e:
-            print(f"Ошибка редактирования сообщения: {e}")
-        
-        bot.send_message(
-            order_info['user_id'],
-            f"❌ Ваш заказ #{order_id} отклонен\n\n"
-            f"🛍️ Товар: {product[1]}\n"
-            f"💰 Сумма: {product[3]}₽\n\n"
-            f"📝 Причина: {reason}\n\n"
-            f"💬 Если у вас есть вопросы, обратитесь в поддержку."
-        )
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_delivery_type' and
+    message.text == "Другое")
+def handle_other_delivery(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['step'] = 'ask_custom_delivery'
+    bot.send_message(user_id, "🚚 Укажите ваш вариант доставки:")
 
-        if product[10]:  # is_exclusive
-            db_actions.update_user_stats(order_info['user_id'], 'bs_coin', product[4])
-            bot.send_message(
-                order_info['user_id'],
-                f"💎 Вам возвращено {product[4]} BS Coin"
-            )
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_custom_delivery')
+def process_custom_delivery(message):
+    user_id = message.from_user.id
+    temp_data[user_id]['order']['delivery_type'] = message.text
+    temp_data[user_id]['order']['step'] = 'ask_payment'
+    
+
+    remove_markup = types.ReplyKeyboardRemove()
+    
+
+    product_id = temp_data[user_id]['order']['product_id']
+    product = db_actions.get_product(product_id)
+    
+    if product:
+        price = product[4] if product[10] else product[3]
+        currency = 'BS Coin' if product[10] else '₽'
         
-        bot.send_message(admin_id, "✅ Заказ отклонен, пользователь уведомлен")
+
+        order_summary = (
+            f"✅ Данные доставки получены!\n\n"
+            f"📋 Ваш заказ:\n"
+            f"🛍️ Товар: {product[1]}\n"
+            f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
+            f"💰 Цена: {price} {currency}\n\n"
+            f"📦 Доставка:\n"
+            f"🏙️ Город: {temp_data[user_id]['order']['city']}\n"
+            f"📍 Адрес: {temp_data[user_id]['order']['address']}\n"
+            f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
+            f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
+            f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
+            f"💳 Теперь отправьте скриншот чека об оплате"
+        )
         
-        del temp_data[admin_id]['reject_order']
-        
-    except Exception as e:
-        print(f"Ошибка обработки причины отклонения: {e}")
-        bot.send_message(admin_id, "❌ Ошибка обработки")
+        bot.send_message(user_id, order_summary, reply_markup=remove_markup)
 
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
     temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_delivery')
 def process_delivery_info(message):
     user_id = message.from_user.id
-    product_id = temp_data[user_id]['order']['product_id']
-    product = db_actions.get_product(product_id)
     
     try:
-        delivery_data = message.text.strip().split('\n')
+
+        temp_data[user_id]['order']['delivery_info'] = message.text
+        temp_data[user_id]['order']['step'] = 'ask_payment'
         
-        if len(delivery_data) < 5:
-            bot.send_message(user_id, "❌ Пожалуйста, заполните ВСЕ поля полностью")
-            return
-        
-        city = delivery_data[0].replace('Город:', '').replace('город:', '').strip()
-        address = delivery_data[1].replace('Адрес:', '').replace('адрес:', '').strip()
-        full_name = delivery_data[2].replace('ФИО:', '').replace('фио:', '').strip()
-        phone = delivery_data[3].replace('Телефон:', '').replace('номер:', '').strip()
-        delivery_type = delivery_data[4].replace('Способ доставки:', '').replace('доставка:', '').strip()
-        
-        temp_data[user_id]['order'].update({
-            'city': city,
-            'address': address,
-            'full_name': full_name,
-            'phone': phone,
-            'delivery_type': delivery_type,
-            'step': 'ask_payment'
-        })
-        
-        bot.send_message(
-            user_id,
+
+        payment_request = (
             "✅ Данные доставки получены!\n\n"
-            f"Необходимо произвести оплату на сумму {product[3]}₽ по номеру - +79123456789\n"
-            "📸 Теперь пришлите фото подтверждения оплаты\n"
-            "(скриншот перевода или чека)"
+            "Теперь отправьте скриншот чека об оплате\n\n"
+            "💳 После оплаты сделайте скриншот и отправьте его сюда"
         )
         
+        bot.send_message(user_id, payment_request)
+        
     except Exception as e:
-        print(f"Ошибка обработки данных доставки: {e}")
-        bot.send_message(user_id, "❌ Ошибка обработки данных. Попробуйте еще раз.")
+        print(f"Ошибка обработки доставки: {e}")
+        bot.send_message(user_id, "❌ Ошибка обработки данных")
+
+
+
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    'reject_order' in temp_data[message.from_user.id])
+def handle_reject_reason(message):
+    try:
+        admin_id = message.from_user.id
+        order_data = temp_data[admin_id]['reject_order']
+        order_id = order_data['order_id']
+        reason = message.text
+        
+
+        db_actions.return_product_quantity(order_id)
+        
+
+        db_actions.update_order_status(order_id, f"❌ ОТКЛОНЕН: {reason}")
+        
+
+        order_info = db_actions.get_order_by_id(order_id)
+        if not order_info:
+            bot.send_message(admin_id, "❌ Заказ не найден")
+            return
+            
+        user_data = db_actions.get_user_data(order_info['user_id'])
+        product = db_actions.get_product(order_info['product_id'])
+        
+        try:
+            if order_data['is_photo']:
+                bot.edit_message_caption(
+                    chat_id=order_data['chat_id'],
+                    message_id=order_data['message_id'],
+                    caption=f"❌ ЗАКАЗ ОТКЛОНЕН: {reason}",
+                    reply_markup=None
+                )
+            else:
+                bot.edit_message_text(
+                    chat_id=order_data['chat_id'],
+                    message_id=order_data['message_id'],
+                    text=f"❌ ЗАКАЗ ОТКЛОНЕН: {reason}",
+                    reply_markup=None
+                )
+        except Exception as e:
+            print(f"Ошибка обновления сообщения: {e}")
+        
+        try:
+
+            user_id_from_order = order_info['user_id']
+            bot.send_message(
+                user_id_from_order,
+                f"❌ Ваш заказ #{order_id} отклонен\n\n"
+                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
+                f"📝 Причина: {reason}\n\n"
+                f"💬 Если у вас есть вопросы, обратитесь в поддержку."
+            )
+            
+
+            if product and product[10]:
+                db_actions.update_user_stats(user_id_from_order, 'bs_coin', product[4])
+                bot.send_message(
+                    user_id_from_order,
+                    f"💎 Вам возвращено {product[4]} BS Coin"
+                )
+        except Exception as e:
+            print(f"Ошибка уведомления пользователя: {e}")
+        
+        bot.send_message(admin_id, "✅ Заказ отклонен, пользователь уведомлен")
+        
+
+        del temp_data[admin_id]['reject_order']
+        
+    except Exception as e:
+        print(f"Ошибка обработки причины отклонения: {e}")
+        bot.send_message(admin_id, "❌ Ошибка обработки")
+
+
 
 @bot.message_handler(content_types=['photo'], 
                     func=lambda message: 
@@ -2435,10 +2949,11 @@ def process_payment_photo(message):
     user_id = message.from_user.id
     
     try:
+
         payment_photo_id = message.photo[-1].file_id
         temp_data[user_id]['order']['payment_photo'] = payment_photo_id
         temp_data[user_id]['order']['step'] = 'confirm_order'
-        
+
         product_id = temp_data[user_id]['order']['product_id']
         product = db_actions.get_product(product_id)
         
@@ -2447,101 +2962,28 @@ def process_payment_photo(message):
                 f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
                 f"📋 Ваш заказ:\n"
                 f"🛍️ Товар: {product[1]}\n"
+                f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
                 f"💰 Цена: {product[3]}₽\n\n"
-                f"📦 Доставка:\n"
-                f"🏙️ Город: {temp_data[user_id]['order']['city']}\n"
-                f"📍 Адрес: {temp_data[user_id]['order']['address']}\n"
-                f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
-                f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
-                f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
+                f"📦 Доставка:\n{temp_data[user_id]['order']['delivery_info']}\n\n"
                 f"📸 Фото оплаты приложено\n\n"
                 f"Выберите действие:"
             )
             
+
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-            confirm_btn = types.KeyboardButton("✅ Подтвердить")
+            confirm_btn = types.KeyboardButton("✅ Подтвердить заказ")
             edit_btn = types.KeyboardButton("✏️ Редактировать данные")
             cancel_btn = types.KeyboardButton("❌ Отменить заказ")
             markup.add(confirm_btn, edit_btn, cancel_btn)
             
+
             bot.send_photo(user_id, payment_photo_id, caption="📸 Ваше фото оплаты:")
             bot.send_message(user_id, order_summary, reply_markup=markup)
         
     except Exception as e:
-        print(f"Ошибка обработки фото оплаты: {e}")
-        bot.send_message(user_id, "❌ Ошибка обработки фото. Попробуйте еще раз.")
+        print(f"Ошибка обработки фото: {e}")
+        bot.send_message(user_id, "❌ Ошибка обработки фото")
 
-
-@bot.message_handler(func=lambda message: 
-    message.from_user.id in temp_data and 
-    temp_data[message.from_user.id].get('order', {}).get('step') == 'ask_delivery')
-def process_delivery_info(message):
-    user_id = message.from_user.id
-    
-    try:
-        delivery_data = message.text.strip().split('\n')
-        
-        if len(delivery_data) < 5:
-            bot.send_message(user_id, "❌ Пожалуйста, заполните все поля полностью")
-            return
-        
-        city = delivery_data[0].strip()
-        address = delivery_data[1].strip()
-        full_name = delivery_data[2].strip()
-        phone = delivery_data[3].strip()
-        delivery_type = delivery_data[4].strip()
-        
-        valid_delivery_types = ['почта россии', 'сдэк', 'почта', 'сдек']
-        if delivery_type.lower() not in valid_delivery_types:
-            bot.send_message(user_id, "❌ Укажите 'Почта России' или 'СДЭК' как способ доставки")
-            return
-
-        if delivery_type.lower() in ['почта россии', 'почта']:
-            delivery_type = 'Почта России'
-        else:
-            delivery_type = 'СДЭК'
-        
-        temp_data[user_id]['order'].update({
-            'city': city,
-            'address': address,
-            'full_name': full_name,
-            'phone': phone,
-            'delivery_type': delivery_type,
-            'step': 'confirm_order'
-        })
-        
-        product_id = temp_data[user_id]['order']['product_id']
-        product = db_actions.get_product(product_id)
-        
-        if product:
-            price = product[4] if product[10] else product[3]
-            currency = 'BS Coin' if product[10] else '₽'
-            
-            order_summary = (
-                f"✅ Данные получены! Проверьте заказ:\n\n"
-                f"🛍️ Товар: {product[1]}\n"
-                f"📏 Размер: {temp_data[user_id]['order']['size']}\n"
-                f"💰 Цена: {price} {currency}\n\n"
-                f"📦 Доставка:\n"
-                f"🏙️ Город: {city}\n"
-                f"📍 Адрес: {address}\n"
-                f"👤 ФИО: {full_name}\n"
-                f"📞 Телефон: {phone}\n"
-                f"🚚 Способ: {delivery_type}\n\n"
-                f"Выберите действие:"
-            )
-            
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-            confirm_btn = types.KeyboardButton("✅ Подтвердить")
-            edit_btn = types.KeyboardButton("✏️ Редактировать данные")
-            cancel_btn = types.KeyboardButton("❌ Отменить заказ")
-            markup.add(confirm_btn, edit_btn, cancel_btn)
-            
-            bot.send_message(user_id, order_summary, reply_markup=markup)
-        
-    except Exception as e:
-        print(f"Ошибка обработки данных доставки: {e}")
-        bot.send_message(user_id, "❌ Ошибка обработки данных. Попробуйте еще раз.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_review_', 'reject_review_')))
 def handle_review_moderation(call):
@@ -2629,77 +3071,80 @@ def select_size(call):
         reply_markup=markup
     )
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('size_', 'size_coin_')))
 def handle_size_selection(call):
     user_id = call.from_user.id
-    parts = call.data.split('_')
-    
-    is_exclusive = parts[0] == 'size_coin'
-    
-    if is_exclusive:
-        product_id = int(parts[2])
-        size = parts[3]
-    else:
-        product_id = int(parts[1])
-        size = parts[2]
-    
-    print(f"DEBUG: Выбран размер - product_id: {product_id}, size: '{size}', exclusive: {is_exclusive}")
-    
-    if not db_actions.check_size_availability(product_id, size):
-        bot.answer_callback_query(call.id, "❌ Этот размер недоступен")
-        return
-    
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    
-    temp_data[user_id]['selected_product'] = product_id
-    temp_data[user_id]['selected_size'] = size
-    temp_data[user_id]['is_exclusive'] = is_exclusive
-    
-    product = db_actions.get_product(product_id)
-    if not product:
-        bot.answer_callback_query(call.id, "❌ Товар не найден")
-        return
-    
-    buttons = Bot_inline_btns()
-    
-    if is_exclusive:
-        markup = types.InlineKeyboardMarkup()
-        buy_btn = types.InlineKeyboardButton(
-            text=f"💎 Купить за {product[4]} BS Coin",
-            callback_data=f"buy_coin_{product_id}_{size}"
-        )
-        markup.add(buy_btn)
-    else:
-        markup = buttons.order_now_button(product_id, size)
-        print(f"DEBUG: Created order_now button for product {product_id}, size {size}")
-    
     try:
-        if call.message.caption:
-            bot.edit_message_caption(
-                chat_id=user_id,
-                message_id=call.message.message_id,
-                caption=call.message.caption,
-                reply_markup=markup
-            )
+        parts = call.data.split('_')
+        
+        is_exclusive = parts[0] == 'size_coin'
+        
+        if is_exclusive:
+            product_id = int(parts[2])
+            size = parts[3]
         else:
-            bot.edit_message_text(
-                chat_id=user_id,
-                message_id=call.message.message_id,
-                text=call.message.text,
-                reply_markup=markup
+            product_id = int(parts[1])
+            size = parts[2]
+        
+        print(f"DEBUG: Выбран размер - product_id: {product_id}, size: '{size}', exclusive: {is_exclusive}")
+        
+        if not db_actions.check_size_availability(product_id, size):
+            bot.answer_callback_query(call.id, "❌ Этот размер недоступен")
+            return
+        
+        if user_id not in temp_data:
+            temp_data[user_id] = {}
+        
+        temp_data[user_id]['selected_product'] = product_id
+        temp_data[user_id]['selected_size'] = size
+        temp_data[user_id]['is_exclusive'] = is_exclusive
+        
+        product = db_actions.get_product(product_id)
+        if not product:
+            bot.answer_callback_query(call.id, "❌ Товар не найден")
+            return
+        
+        markup = types.InlineKeyboardMarkup()
+        
+        if is_exclusive:
+            buy_btn = types.InlineKeyboardButton(
+                text=f"💎 Купить за {product[4]} BS Coin",
+                callback_data=f"buy_coin_{product_id}_{size}"
             )
+            markup.add(buy_btn)
+        else:
+            order_btn = types.InlineKeyboardButton(
+                text="🛒 Заказать сейчас",
+                callback_data=f"order_{product_id}_{size}"
+            )
+            markup.add(order_btn)
         
-        bot.answer_callback_query(call.id, f"✅ Выбран размер: {size}")
-        
+        try:
+            if call.message.caption:
+                bot.edit_message_caption(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    caption=call.message.caption,
+                    reply_markup=markup
+                )
+            else:
+                bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    text=call.message.text,
+                    reply_markup=markup
+                )
+            
+            bot.answer_callback_query(call.id, f"✅ Выбран размер: {size}")
+            
+        except Exception as e:
+            print(f"Ошибка редактирования: {e}")
+            bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
+                
     except Exception as e:
-        print(f"Ошибка редактирования сообщения: {e}")
+        print(f"Ошибка в handle_size_selection: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
 
-@bot.callback_query_handler(func=lambda call: True)
-def debug_all_callbacks(call):
-    print(f"DEBUG CALLBACK RECEIVED: {call.data} from user {call.from_user.id}")
 
 # ============ ОБРАБОТЧИКИ СООБЩЕНИЙ ============
 
@@ -2715,9 +3160,6 @@ def handle_messages(message):
         handle_review(message)
         return
         
-    if user_id in temp_data and temp_data[user_id].get('step') == 'waiting_delivery_info':
-        process_delivery_info(message)
-        return
 
 def handle_post_creation(message):
     user_id = message.from_user.id
@@ -2798,19 +3240,6 @@ def handle_review(message):
                     f"✅ Текст отзыва сохранен. Можете прикрепить до {remaining_photos} фото или отправьте /done для завершения"
                 )
 
-def process_delivery_info(message):
-    user_id = message.from_user.id
-    delivery_info = message.text
-    
-    send_order_to_admin(user_id, delivery_info)
-    
-    bot.send_message(
-        user_id,
-        "✅ Ваш заказ принят! Ожидайте подтверждения."
-    )
-    
-    if user_id in temp_data:
-        del temp_data[user_id]
 
 @bot.channel_post_handler(content_types=['text'])
 def handle_channel_post(message):
@@ -2828,6 +3257,7 @@ def handle_topic_messages(message):
     db_actions.update_user_stats(user_id, 'comments', 1)
     
     check_comment_achievement(user_id)
+
 
 # ============ ЗАПУСК БОТА ============
 

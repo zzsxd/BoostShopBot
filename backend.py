@@ -409,10 +409,10 @@ class DbAct:
 
     def create_detailed_order(self, user_id, product_id, size, city, address, full_name, phone, delivery_type):
         try:
-            print(f"DEBUG: Создание заказа - user_id: {user_id}, product_id: {product_id}, size: {size}")
+            print(f"DEBUG: Создание заказа для user_id: {user_id}, product_id: {product_id}, size: {size}")
             
             variation_data = self.__db.db_read(
-                'SELECT variation_id FROM product_variations WHERE product_id = ? AND size = ?',
+                'SELECT variation_id, quantity FROM product_variations WHERE product_id = ? AND size = ?',
                 (product_id, str(size))
             )
             
@@ -422,16 +422,31 @@ class DbAct:
                 print(f"❌ Вариация не найдена - product_id: {product_id}, size: {size}")
                 return None
                 
-            variation_id = variation_data[0][0]
-            print(f"DEBUG: Используем variation_id: {variation_id}")
+            variation_id, current_quantity = variation_data[0]
             
+            # Проверяем достаточность товара
+            if current_quantity <= 0:
+                print(f"❌ Товара нет в наличии - product_id: {product_id}, size: {size}")
+                return None
+                
+            print(f"DEBUG: Используем variation_id: {variation_id}, количество: {current_quantity}")
+            
+            # СОЗДАЕМ ЗАПИСЬ В БАЗЕ С ПРАВИЛЬНЫМ user_id
             result = self.__db.db_write(
                 '''INSERT INTO orders_detailed 
                 (user_id, product_id, variation_id, quantity, city, address, full_name, phone, delivery_type) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (user_id, product_id, variation_id, 1, city, address, full_name, phone, delivery_type)
+                (user_id, product_id, variation_id, 1, city, address, full_name, phone, delivery_type)  # Убедитесь что user_id правильный
             )
             
+            # Уменьшаем количество товара
+            if result:
+                success = self.__db.db_write(
+                    'UPDATE product_variations SET quantity = quantity - 1 WHERE variation_id = ? AND quantity > 0',
+                    (variation_id,)
+                )
+                print(f"DEBUG: Уменьшение количества - success: {success}")
+                
             print(f"DEBUG: Результат создания заказа: {result}")
             return result
             
@@ -459,30 +474,38 @@ class DbAct:
             return False
 
     def get_order_by_id(self, order_id):
-        data = self.__db.db_read(
-            '''SELECT order_id, user_id, product_id, city, address, 
-                    full_name, phone, delivery_type, status, 
-                    admin_message_id, admin_topic_id, created_at
-            FROM orders_detailed WHERE order_id = ?''', 
-            (order_id,)
-        )
-        if data and data[0]:
-            row = data[0]
-            return {
-                'order_id': row[0],
-                'user_id': row[1],
-                'product_id': row[2],
-                'city': row[3],
-                'address': row[4],
-                'full_name': row[5],
-                'phone': row[6],
-                'delivery_type': row[7],
-                'status': row[8],
-                'admin_message_id': row[9],
-                'admin_topic_id': row[10],
-                'created_at': row[11]
-            }
-        return None
+        try:
+            # Ищем самый свежий заказ с этим order_id
+            data = self._DbAct__db.db_read(
+                '''SELECT order_id, user_id, product_id, city, address, 
+                        full_name, phone, delivery_type, status, 
+                        admin_message_id, admin_topic_id, created_at
+                FROM orders_detailed 
+                WHERE order_id = ? 
+                ORDER BY created_at DESC LIMIT 1''', 
+                (order_id,)
+            )
+            if data and data[0]:
+                row = data[0]
+                print(f"DEBUG get_order_by_id: order_id={order_id}, found_user_id={row[1]}")
+                return {
+                    'order_id': row[0],
+                    'user_id': row[1],
+                    'product_id': row[2],
+                    'city': row[3],
+                    'address': row[4],
+                    'full_name': row[5],
+                    'phone': row[6],
+                    'delivery_type': row[7],
+                    'status': row[8],
+                    'admin_message_id': row[9],
+                    'admin_topic_id': row[10],
+                    'created_at': row[11]
+                }
+            return None
+        except Exception as e:
+            print(f"Ошибка в get_order_by_id: {e}")
+            return None
 
     def update_order_status(self, order_id, status):
         return self.__db.db_write(
@@ -535,26 +558,51 @@ class DbAct:
             return []
     
     def check_size_availability(self, product_id, size):
+        """Проверяет доступность размера"""
         try:
-            size_str = str(size)
-            
-            data = self.__db.db_read(
-                'SELECT quantity, size FROM product_variations WHERE product_id = ?',
-                (product_id,)
+            variations = self.get_product_variations(product_id)
+            for variation in variations:
+                # Сравниваем как строки, убирая лишние пробелы
+                var_size = str(variation['size']).strip()
+                input_size = str(size).strip()
+                
+                if var_size == input_size:
+                    return variation['quantity'] > 0
+            return False
+        except Exception as e:
+            print(f"Ошибка проверки размера: {e}")
+            return False
+        
+    def return_product_quantity(self, order_id):
+        """Возвращает товар на склад при отмене заказа"""
+        try:
+            # Получаем информацию о заказе
+            order_data = self.get_order_by_id(order_id)
+            if not order_data:
+                return False
+                
+            # Получаем variation_id из заказа
+            variation_data = self.__db.db_read(
+                'SELECT variation_id, quantity FROM orders_detailed WHERE order_id = ?',
+                (order_id,)
             )
             
-            if not data:
+            if not variation_data:
                 return False
-            
-            for row in data:
-                db_size = str(row[1])
-                db_quantity = row[0]
                 
-                if db_size == size_str:
-                    return db_quantity > 0
-                    
-            return False
+            variation_id, order_quantity = variation_data[0]
+            
+            # Возвращаем товар на склад
+            success = self.__db.db_write(
+                'UPDATE product_variations SET quantity = quantity + ? WHERE variation_id = ?',
+                (order_quantity, variation_id)
+            )
+            
+            print(f"DEBUG: Возврат товара - order_id: {order_id}, variation_id: {variation_id}, quantity: {order_quantity}, success: {success}")
+            return bool(success)
             
         except Exception as e:
-            print(f"Ошибка проверки доступности размера: {e}")
+            print(f"Ошибка возврата товара: {e}")
+            import traceback
+            traceback.print_exc()
             return False
