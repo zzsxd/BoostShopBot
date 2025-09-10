@@ -588,7 +588,8 @@ def cancel_order(message):
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    
+    if user_id in temp_data:
+        del temp_data[user_id]
     buttons = Bot_inline_btns()
     
     is_new_user = not db_actions.user_exists(user_id)
@@ -2007,6 +2008,16 @@ def ask_phone(message):
     markup.add(types.KeyboardButton("Другое"))
     
     bot.send_message(user_id, "🚚 Выберите способ доставки:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '🛒 Заказать товар')
+def handle_order_button(message):
+    bot.send_message(
+        message.chat.id,
+        "📦 Для заказа товара перейдите в наш канал:\n"
+        "👉 @BridgeSide_Store\n\n"
+        "Или нажмите на ссылку: https://t.me/BridgeSide_Store",
+        parse_mode='HTML'
+    )
 
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
