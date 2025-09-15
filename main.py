@@ -1673,8 +1673,17 @@ def handle_exclusive_post(call):
     user_id = call.from_user.id
     is_exclusive = (call.data == 'exclusive_yes_post')
     
-    if user_id not in temp_data:
-        bot.answer_callback_query(call.id, "❌ Ошибка процесса")
+    # Улучшенная проверка состояния
+    if user_id not in temp_data or 'product_id' not in temp_data[user_id]:
+        try:
+            bot.answer_callback_query(call.id, "❌ Процесс создания поста прерван. Начните заново.")
+            bot.edit_message_text(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                text="❌ Процесс прерван. Используйте /create_post для начала заново."
+            )
+        except:
+            bot.send_message(user_id, "❌ Процесс прерван. Используйте /create_post для начала заново.")
         return
         
     product_id = temp_data[user_id]['product_id']
@@ -1684,38 +1693,52 @@ def handle_exclusive_post(call):
         bot.answer_callback_query(call.id, "❌ Товар не найден")
         return
     
-    if is_exclusive:
-        temp_data[user_id]['step'] = 'ask_coin_price_post'
-        bot.edit_message_text(
-            chat_id=user_id,
-            message_id=call.message.message_id,
-            text="💎 Укажите цену в BS Coin:"
-        )
-    else:
-        db_actions.update_product_exclusive(product_id, False, 0)
-        success = publish_post_to_channel(
-            product_id,
-            temp_data[user_id]['photos'],
-            temp_data[user_id]['text'],
-            False,
-            0
-        )
-        
-        if success:
-            bot.answer_callback_query(call.id, "✅ Пост опубликован!")
+    try:
+        if is_exclusive:
+            temp_data[user_id]['step'] = 'ask_coin_price_post'
             bot.edit_message_text(
                 chat_id=user_id,
                 message_id=call.message.message_id,
-                text=f"✅ Товар успешно опубликован в @BridgeSide_Store\n\n"
-                    f"🛍️ Товар: {temp_data[user_id]['product_name']}\n"
-                    f"🎯 Статус: Обычный (рубли)\n"
-                    f"💰 Цена: {product[3]}₽"
+                text="💎 Укажите цену в BS Coin (только целое число):\n\n❌ Отправьте /cancel для отмены"
             )
         else:
-            bot.answer_callback_query(call.id, "❌ Ошибка публикации")
+            # Обновляем статус товара в базе
+            success = db_actions.update_product_exclusive(product_id, False, 0)
+            if not success:
+                bot.answer_callback_query(call.id, "❌ Ошибка обновления товара")
+                return
+                
+            # Публикуем пост
+            post_success = publish_post_to_channel(
+                product_id,
+                temp_data[user_id].get('photos', []),
+                temp_data[user_id].get('text', ''),
+                False,
+                0
+            )
             
-        if user_id in temp_data:
-            del temp_data[user_id]
+            if post_success:
+                bot.answer_callback_query(call.id, "✅ Пост опубликован!")
+                bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    text=f"✅ Товар успешно опубликован в @BridgeSide_Store\n\n"
+                        f"🛍️ Товар: {temp_data[user_id].get('product_name', 'Неизвестно')}\n"
+                        f"🎯 Статус: Обычный (рубли)\n"
+                        f"💰 Цена: {product[3]}₽"
+                )
+            else:
+                bot.answer_callback_query(call.id, "❌ Ошибка публикации")
+                bot.send_message(user_id, "❌ Не удалось опубликовать пост. Проверьте настройки канала.")
+            
+            # Очищаем временные данные
+            if user_id in temp_data:
+                del temp_data[user_id]
+                
+    except Exception as e:
+        print(f"Ошибка в handle_exclusive_post: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка обработки")
+        bot.send_message(user_id, "❌ Произошла ошибка. Попробуйте снова /create_post")
 
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
@@ -1734,8 +1757,8 @@ def handle_coin_price_input(message):
 def process_coin_price_post(message):
     user_id = message.from_user.id
     
-    if user_id not in temp_data or temp_data[user_id]['step'] != 'ask_coin_price_post':
-        bot.send_message(user_id, "❌ Ошибка процесса. Начните заново.")
+    if user_id not in temp_data or temp_data[user_id].get('step') != 'ask_coin_price_post':
+        bot.send_message(user_id, "❌ Ошибка процесса. Используйте /create_post для начала заново.")
         return
         
     if message.text.lower() == '/cancel':
@@ -1754,31 +1777,40 @@ def process_coin_price_post(message):
         
         if not product:
             bot.send_message(user_id, "❌ Товар не найден")
+            if user_id in temp_data:
+                del temp_data[user_id]
             return
             
-        db_actions.update_product_exclusive(product_id, True, coin_price)
+        # Обновляем статус товара
+        success = db_actions.update_product_exclusive(product_id, True, coin_price)
+        if not success:
+            bot.send_message(user_id, "❌ Ошибка обновления товара")
+            if user_id in temp_data:
+                del temp_data[user_id]
+            return
         
-        success = publish_post_to_channel(
+        # Публикуем пост
+        post_success = publish_post_to_channel(
             product_id,
-            temp_data[user_id]['photos'],
-            temp_data[user_id]['text'],
+            temp_data[user_id].get('photos', []),
+            temp_data[user_id].get('text', ''),
             True,
             coin_price
         )
         
-        if success:
+        if post_success:
             bot.send_message(
                 user_id,
                 f"✅ Товар успешно опубликован в @BridgeSide_Store\n\n"
-                f"🛍️ Товар: {temp_data[user_id]['product_name']}\n"
+                f"🛍️ Товар: {temp_data[user_id].get('product_name', 'Неизвестно')}\n"
                 f"🎯 Статус: Эксклюзивный\n"
                 f"💎 Цена: {coin_price} BS Coin"
             )
         else:
-            bot.send_message(user_id, "❌ Ошибка при публикации поста")
+            bot.send_message(user_id, "❌ Ошибка при публикации поста. Проверьте настройки канала.")
         
     except ValueError:
-        bot.send_message(user_id, "❌ Неверный формат цены. Используйте только целые числа.")
+        bot.send_message(user_id, "❌ Неверный формат цены. Используйте только целые положительные числа.")
         bot.send_message(user_id, "💎 Укажите цену в BS Coin:")
         return
     except Exception as e:
@@ -1819,31 +1851,91 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
         if photos and len(photos) > 0:
             media = []
             
+            # Первое фото с caption
             media.append(types.InputMediaPhoto(
                 photos[0], 
                 caption=caption,
                 parse_mode="Markdown"
             ))
 
+            # Остальные фото без caption
             for photo in photos[1:]:
                 media.append(types.InputMediaPhoto(photo))
 
-            bot.send_media_group(
-                chat_id=channel_id,
-                media=media
-            )
+            try:
+                bot.send_media_group(
+                    chat_id=channel_id,
+                    media=media
+                )
+                return True
+            except Exception as e:
+                print(f"Ошибка отправки медиагруппы: {e}")
+                # Пробуем отправить текстовое сообщение
+                try:
+                    bot.send_message(
+                        chat_id=channel_id,
+                        text=caption,
+                        parse_mode="Markdown"
+                    )
+                    return True
+                except Exception as e2:
+                    print(f"Ошибка отправки текста: {e2}")
+                    return False
         else:
-            bot.send_message(
-                chat_id=channel_id,
-                text=caption,
-                parse_mode="Markdown"
-            )
+            # Если нет фото, отправляем текстовое сообщение
+            try:
+                bot.send_message(
+                    chat_id=channel_id,
+                    text=caption,
+                    parse_mode="Markdown"
+                )
+                return True
+            except Exception as e:
+                print(f"Ошибка отправки текста: {e}")
+                return False
             
-        return True
-        
     except Exception as e:
         print(f"Ошибка публикации в канал: {e}")
         return False
+    
+@bot.message_handler(func=lambda message: 
+    message.from_user.id in temp_data and 
+    temp_data[message.from_user.id].get('step') in ['add_photos', 'add_text'])
+def handle_post_creation(message):
+    user_id = message.from_user.id
+    
+    if message.text == '/cancel':
+        if user_id in temp_data:
+            del temp_data[user_id]
+        bot.send_message(user_id, "❌ Создание поста отменено")
+        return
+        
+    try:
+        if temp_data[user_id]['step'] == 'add_photos':
+            if message.content_type == 'photo':
+                if len(temp_data[user_id]['photos']) < 6:
+                    temp_data[user_id]['photos'].append(message.photo[-1].file_id)
+                    remaining = 6 - len(temp_data[user_id]['photos'])
+                    if remaining > 0:
+                        bot.send_message(user_id, f"📸 Фото добавлено. Можно добавить еще {remaining} фото")
+                    else:
+                        bot.send_message(user_id, "✅ Максимум фото достигнут. Теперь отправьте текст поста")
+                else:
+                    bot.send_message(user_id, "❌ Максимум 6 фотографий. Отправьте текст поста")
+            elif message.content_type == 'text':
+                temp_data[user_id]['step'] = 'add_text'
+                temp_data[user_id]['text'] = message.text
+                ask_exclusive_status(user_id)
+                
+        elif temp_data[user_id]['step'] == 'add_text':
+            temp_data[user_id]['text'] = message.text
+            ask_exclusive_status(user_id)
+            
+    except Exception as e:
+        print(f"Ошибка создания поста: {e}")
+        bot.send_message(user_id, "❌ Ошибка обработки. Попробуйте снова /create_post")
+        if user_id in temp_data:
+            del temp_data[user_id]
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('size_', 'size_coin_')))
 def handle_size_selection(call):
