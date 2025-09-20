@@ -8,6 +8,11 @@ import threading
 import platform
 import logging
 import pandas as pd
+import requests
+import urllib.parse
+import pathlib
+import shutil
+import time
 from threading import Lock
 from datetime import datetime, timedelta
 from config_parser import ConfigParser
@@ -15,26 +20,312 @@ from frontend import Bot_inline_btns
 from telebot import types
 from backend import DbAct
 from db import DB
+from logging_config import setup_logging, get_logger, log_error, log_info
+
+# Инициализация логирования
+setup_logging()
+logger = get_logger('bot')
+
+print("Инициализация бота...")
+log_info(logger, "Старт инициализации")
 
 config_name = 'secrets.json'
 os_type = platform.system()
 work_dir = os.path.dirname(os.path.realpath(__file__))
-config = ConfigParser(f'{work_dir}/{config_name}', os_type)
-db = DB(config.get_config()['db_file_name'], Lock())
-db_actions = DbAct(db, config, config.get_config()['xlsx_path'])
-bot = telebot.TeleBot(config.get_config()['tg_api'])
+
+try:
+    config = ConfigParser(f'{work_dir}/{config_name}', os_type)
+    config_data = config.get_config()
+    mysql_config = config_data.get('mysql', {})
+    db = DB(
+        host=mysql_config.get('host', '127.0.0.1'),
+        user=mysql_config.get('user', 'root'),
+        password=mysql_config.get('password', '12345678'),
+        database=mysql_config.get('database', 'bridgeside_bot'),
+        port=mysql_config.get('port', 3306),
+        lock=Lock()
+    )
+    db_actions = DbAct(db, config, config_data['xlsx_path'])
+    bot = telebot.TeleBot(config.get_config()['tg_api'])
+except SystemExit as e:
+    # Ошибки из ConfigParser (например, нет secrets.json или пустой tg_api)
+    log_error(logger, e, "Ошибка конфигурации при запуске")
+    print(f"Ошибка конфигурации: {e}")
+    raise
+except Exception as e:
+    # Любые другие ошибки ранней инициализации (например, БД)
+    log_error(logger, e, "Ошибка ранней инициализации")
+    print(f"Ошибка инициализации: {e}")
+    raise
 
 temp_data = {}
 pending_reviews = {}
-
-config_data = config.get_config()
 channels = [
     '@BridgeSide_Featback',
     '@BridgeSide_LifeStyle', 
     '@BridgeSide_Store'
 ]
 
+# ============ СИСТЕМА АЧИВОК ============
+
+ACHIEVEMENTS = {
+    # Линия "МОСТ" — стиль + технологии
+    'pilot_bridge': {
+        'name': '🛸 Пилот Моста',
+        'description': 'Первая покупка',
+        'category': 'МОСТ',
+        'bs_coin_reward': 500,
+        'discount_bonus': 0,
+        'condition': 'first_purchase'
+    },
+    'style_engineer': {
+        'name': '⚙️ Инженер Стиля',
+        'description': 'Лук: 3+ вещи разных брендов в одном заказе',
+        'category': 'МОСТ',
+        'bs_coin_reward': 1000,
+        'discount_bonus': 0,
+        'condition': 'multi_brand_order'
+    },
+    
+    # Линия "БЕРЕГ" — лояльность
+    'pioneer': {
+        'name': '💡 Первопроходец',
+        'description': 'Первый отзыв с фото',
+        'category': 'БЕРЕГ',
+        'bs_coin_reward': 100,
+        'discount_bonus': 0,
+        'condition': 'first_review_with_photo'
+    },
+    'cornerstone': {
+        'name': '🧱 Краеугольный Камень',
+        'description': 'Уровень лояльности 5 "Легенда"',
+        'category': 'БЕРЕГ',
+        'bs_coin_reward': 1000,
+        'discount_bonus': 10,
+        'condition': 'loyalty_level_5'
+    },
+    
+    # Линия "КОЛЛЕКТИВ" — за приглашения
+    'connector': {
+        'name': '🔌 Соединяющий',
+        'description': 'Привёл 3 зарегистрировавшихся друга по реф-ссылке',
+        'category': 'КОЛЛЕКТИВ',
+        'bs_coin_reward': 300,
+        'discount_bonus': 0,
+        'condition': 'three_referrals'
+    }
+}
+
+def check_achievement_conditions(user_id, condition_type, **kwargs):
+    """Проверить условия для получения ачивок"""
+    try:
+        for achievement_code, achievement_data in ACHIEVEMENTS.items():
+            if achievement_data['condition'] == condition_type:
+                # Проверяем, есть ли уже эта ачивка
+                if db_actions.get_achievement_by_code(user_id, achievement_code):
+                    continue
+                
+                # Проверяем условие
+                if check_achievement_condition(user_id, condition_type, achievement_code, **kwargs):
+                    # Добавляем ачивку
+                    if db_actions.add_achievement(user_id, achievement_code, achievement_data):
+                        # Уведомляем пользователя
+                        notify_achievement_earned(user_id, achievement_data)
+                        return True
+    except Exception as e:
+        log_error(logger, e, f"Ошибка проверки ачивок для пользователя {user_id}")
+    return False
+
+def check_achievement_condition(user_id, condition_type, achievement_code, **kwargs):
+    """Проверить конкретное условие ачивки"""
+    try:
+        if condition_type == 'first_purchase':
+            # Первая покупка
+            orders = db_actions.get_user_orders(user_id)
+            return len(orders) == 1
+            
+        elif condition_type == 'multi_brand_order':
+            # 3+ вещи разных брендов в одном заказе
+            # Это нужно будет реализовать при создании заказов
+            return False  # Пока не реализовано
+            
+        elif condition_type == 'first_review_with_photo':
+            # Первый отзыв с фото
+            reviews = db_actions.get_user_reviews(user_id)
+            for review in reviews:
+                if review.get('photos') and len(review['photos']) > 0:
+                    return True
+            return False
+            
+        elif condition_type == 'loyalty_level_5':
+            # Уровень лояльности 5 "Легенда"
+            # Это нужно будет реализовать на основе системы лояльности
+            return False  # Пока не реализовано
+            
+        elif condition_type == 'three_referrals':
+            # 3 реферала
+            referral_count = db_actions.get_referral_stats(user_id)
+            return referral_count >= 3
+            
+    except Exception as e:
+        log_error(logger, e, f"Ошибка проверки условия ачивки {achievement_code}")
+    return False
+
+def notify_achievement_earned(user_id, achievement_data):
+    """Уведомить пользователя о получении ачивки"""
+    try:
+        message = (
+            f"🎉 Поздравляем! Вы получили ачивку!\n\n"
+            f"{achievement_data['name']}\n"
+            f"{achievement_data['description']}\n\n"
+        )
+        
+        if achievement_data['bs_coin_reward'] > 0:
+            message += f"💰 +{achievement_data['bs_coin_reward']} BS Coin\n"
+        
+        if achievement_data['discount_bonus'] > 0:
+            message += f"🎯 +{achievement_data['discount_bonus']}% постоянная скидка\n"
+        
+        message += f"\n🏆 Категория: {achievement_data['category']}"
+        
+        bot.send_message(user_id, message)
+        
+    except Exception as e:
+        log_error(logger, e, f"Ошибка уведомления о ачивке для пользователя {user_id}")
+
+# ============ ИНТЕГРАЦИЯ С ЯНДЕКС.ДИСК ============
+
+YANDEX_DISK_BASE_PATH = "BridgeSideBot/Boots"
+YANDEX_OAUTH_URL = "https://oauth.yandex.ru/authorize"
+YANDEX_TOKEN_URL = "https://oauth.yandex.ru/token"
+
+def get_yadisk_tokens():
+    """Получить токены Яндекс.Диска с автоматическим обновлением"""
+    cfg = config.get_config()
+    yadisk_config = cfg.get('yadisk', {})
+    
+    client_id = yadisk_config.get('client_id')
+    client_secret = yadisk_config.get('client_secret')
+    access_token = yadisk_config.get('access_token')
+    refresh_token = yadisk_config.get('refresh_token')
+    expires_at = yadisk_config.get('expires_at', 0)
+    
+    if not client_id or not client_secret:
+        raise RuntimeError("Не настроены client_id и client_secret для Яндекс.Диска")
+    
+    # Проверяем, не истёк ли токен
+    if access_token and expires_at > time.time():
+        return access_token
+    
+    # Если есть refresh_token, обновляем токен
+    if refresh_token:
+        try:
+            new_tokens = refresh_yadisk_token(client_id, client_secret, refresh_token)
+            config.update_yadisk_tokens(
+                new_tokens['access_token'],
+                new_tokens['refresh_token'],
+                new_tokens['expires_in']
+            )
+            return new_tokens['access_token']
+        except Exception as e:
+            log_error(logger, e, "Ошибка обновления токена Яндекс.Диска")
+    
+    # Если нет токенов или не удалось обновить
+    raise RuntimeError("Требуется авторизация Яндекс.Диска. Используйте /yadisk_auth")
+
+def refresh_yadisk_token(client_id, client_secret, refresh_token):
+    """Обновить токен Яндекс.Диска"""
+    data = {
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+        'client_id': client_id,
+        'client_secret': client_secret
+    }
+    
+    response = requests.post(YANDEX_TOKEN_URL, data=data, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+def yadisk_headers(token: str) -> dict:
+    return {"Authorization": f"OAuth {token}"}
+
+def yadisk_list_images(product_id: str) -> list:
+    token = get_yadisk_tokens()
+    folder = f"{YANDEX_DISK_BASE_PATH}/{product_id}"
+    params = {
+        "path": folder,
+        "limit": 1000,
+        "fields": "name,_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.media_type",
+        "_embedded.limit": 1000,
+    }
+    r = requests.get("https://cloud-api.yandex.net/v1/disk/resources",
+                     headers=yadisk_headers(token), params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    items = (data.get("_embedded") or {}).get("items", [])
+    return [it["path"] for it in items if it.get("type") == "file" and (it.get("media_type") or "").startswith("image")]
+
+def yadisk_get_download_href(file_path: str) -> str:
+    token = get_yadisk_tokens()
+    r = requests.get("https://cloud-api.yandex.net/v1/disk/resources/download",
+                     headers=yadisk_headers(token), params={"path": file_path}, timeout=20)
+    r.raise_for_status()
+    return r.json()["href"]
+
+def download_photos_from_yadisk(product_id: str) -> list:
+    dest_dir = os.path.join("/tmp", "bsbot", str(product_id))
+    pathlib.Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    local_files: list[str] = []
+    for ypath in yadisk_list_images(product_id):
+        href = yadisk_get_download_href(ypath)
+        with requests.get(href, headers=yadisk_headers(get_yadisk_tokens()), stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            filename = os.path.basename(urllib.parse.urlparse(ypath).path)
+            local_path = os.path.join(dest_dir, filename)
+            with open(local_path, "wb") as f:
+                shutil.copyfileobj(resp.raw, f)
+            local_files.append(local_path)
+    return local_files
+
+def cleanup_local_files(paths: list) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+
+def get_product_field(product, field_name, default=None):
+    """Получить поле продукта по имени для совместимости с MySQL"""
+    if isinstance(product, dict):
+        return product.get(field_name, default)
+    elif isinstance(product, (list, tuple)):
+        # Маппинг полей для обратной совместимости
+        field_mapping = {
+            'product_id': 0,
+            'name': 1,
+            'description': 2,
+            'price': 3,
+            'price_yuan': 4,
+            'coin_price': 5,
+            'photo_id': 6,
+            'category': 7,
+            'topic': 8,
+            'is_available': 9,
+            'is_exclusive': 10
+        }
+        index = field_mapping.get(field_name, -1)
+        return product[index] if 0 <= index < len(product) else default
+    return default
+
+def get_product_price(product):
+    """Получить цену продукта"""
+    return get_product_field(product, 'price', 0), '₽'
+
+def get_product_name(product):
+    """Получить название продукта"""
+    return get_product_field(product, 'name', 'Неизвестно')
 
 def show_product(user_id, product_id):
     product = db_actions.get_product(product_id)
@@ -46,37 +337,27 @@ def show_product(user_id, product_id):
     
     buttons = Bot_inline_btns()
     
-    is_exclusive = product[10] == 1
-    
-    if is_exclusive:
-        caption = (
-            f"🎯 ЭКСКЛЮЗИВНЫЙ ТОВАР\n\n"
-            f"🛍️ {product[1]}\n\n"
-            f"📝 {product[2]}\n"
-            f"💎 Цена: {product[4]} BS Coin\n\n"
-            f"📏 Доступные размеры:"
-        )
-    else:
-        caption = (
-            f"🛍️ {product[1]}\n\n"
-            f"📝 {product[2]}\n"
-            f"💰 Цена: {product[3]}₽\n\n"
-            f"📏 Доступные размеры:"
-        )
+    caption = (
+        f"🛍️ {get_product_field(product, 'name', 'Неизвестно')}\n\n"
+        f"📝 {get_product_field(product, 'description', '')}\n"
+        f"💰 Цена: {get_product_field(product, 'price', 0)}₽\n\n"
+        f"📏 Доступные размеры:"
+    )
     
     for variation in available_sizes:
         caption += f"\n• {variation['size']} - {variation['quantity']} шт."
     
     if available_sizes:
-        markup = buttons.size_selection_buttons(available_sizes, is_exclusive)
+        markup = buttons.size_selection_buttons(available_sizes)
     else:
         markup = None
         
-    if product[6] and product[6] != 'None' and product[6] != 'invalid':
+    photo_id = get_product_field(product, 'photo_id')
+    if photo_id and photo_id != 'None' and photo_id != 'invalid':
         try:
             bot.send_photo(
                 user_id,
-                product[6],
+                photo_id,
                 caption=caption,
                 reply_markup=markup
             )
@@ -98,13 +379,13 @@ def check_and_fix_photos():
             if photo_id:
                 try:
                     file_info = bot.get_file(photo_id)
-                    print(f"✅ Photo {photo_id} для товара {name} доступен")
+                    log_info(logger, f"Photo {photo_id} для товара {name} доступен")
                 except Exception as e:
-                    print(f"❌ Photo {photo_id} для товара {name} недоступен: {e}")
+                    log_error(logger, e, f"Photo {photo_id} для товара {name} недоступен")
                     db_actions.update_product_photo(product_id, None)
-        print("Проверка фото завершена")
+        log_info(logger, "Проверка фото завершена")
     except Exception as e:
-        print(f"Ошибка при проверке фото: {e}")
+        log_error(logger, e, "Ошибка при проверке фото")
 
 def handle_daily_bonus(user_id):
     user_data = db_actions.get_user_data(user_id)
@@ -137,17 +418,6 @@ def check_comment_achievement(user_id):
                 "🏆 Достижение «Активный комментатор»! Ваша скидка увеличена на 1%"
             )
 
-def ask_exclusive_status(user_id):
-    markup = types.InlineKeyboardMarkup()
-    btn_yes = types.InlineKeyboardButton("✅ Да", callback_data="exclusive_yes_post")
-    btn_no = types.InlineKeyboardButton("❌ Нет", callback_data="exclusive_no_post")
-    markup.add(btn_yes, btn_no)
-    
-    bot.send_message(
-        user_id,
-        "🎯 Это эксклюзивный товар (только за BS Coin)?",
-        reply_markup=markup
-    )
 
 def process_products_file(message):
     user_id = message.from_user.id
@@ -253,10 +523,37 @@ def process_products_file(message):
         if os.path.exists(filename):
             os.remove(filename)
 
+def create_review_topic(user_data):
+    """Создать топик для отзыва в группе админов"""
+    try:
+        admin_group_id = -1002585832553
+        topic_name = f"{user_data['first_name']} {user_data['last_name']} ОТЗЫВ"
+        
+        # Создаем топик
+        result = bot.create_forum_topic(
+            chat_id=admin_group_id,
+            name=topic_name
+        )
+        
+        if result and result.message_thread_id:
+            return result.message_thread_id
+        else:
+            log_error(logger, None, f"Не удалось создать топик для отзыва: {topic_name}")
+            return None
+            
+    except Exception as e:
+        log_error(logger, e, f"Ошибка создания топика для отзыва: {topic_name}")
+        return None
+
 def send_review_for_moderation(user_id, review_data):
     try:
         user_data = db_actions.get_user_data(user_id)
         admin_group_id = -1002585832553
+        
+        # Создаем топик для отзыва
+        topic_id = create_review_topic(user_data)
+        if not topic_id:
+            log_error(logger, None, "Не удалось создать топик для отзыва, отправляем в общий чат")
         
         caption = (
             f"📝 Новый отзыв на модерацию\n\n"
@@ -275,26 +572,74 @@ def send_review_for_moderation(user_id, review_data):
         pending_reviews[review_id] = review_data
         
         if review_data.get('photos'):
-            message = bot.send_photo(
-                chat_id=admin_group_id,
-                photo=review_data['photos'][0],
-                caption=caption,
-                reply_markup=markup
-            )
+            # Отправляем медиагруппу с фотографиями
+            media = []
             
-            pending_reviews[review_id]['message_id'] = message.message_id
+            # Первое фото с caption и кнопками
+            media.append(types.InputMediaPhoto(
+                review_data['photos'][0], 
+                caption=caption
+            ))
             
+            # Остальные фото без caption
             for photo in review_data['photos'][1:]:
-                bot.send_photo(
-                    chat_id=admin_group_id,
-                    photo=photo
-                )
+                media.append(types.InputMediaPhoto(photo))
+            
+            try:
+                send_params = {"chat_id": admin_group_id, "media": media}
+                if topic_id:
+                    send_params["message_thread_id"] = topic_id
+                    
+                messages = bot.send_media_group(**send_params)
+                # Сохраняем ID первого сообщения для кнопок
+                pending_reviews[review_id]['message_id'] = messages[0].message_id
+                
+                # Отправляем кнопки отдельным сообщением
+                button_params = {
+                    "chat_id": admin_group_id,
+                    "text": "Выберите действие:",
+                    "reply_markup": markup
+                }
+                if topic_id:
+                    button_params["message_thread_id"] = topic_id
+                    
+                bot.send_message(**button_params)
+                
+            except Exception as e:
+                log_error(logger, e, "Ошибка отправки медиагруппы отзыва на модерацию")
+                # Fallback: отправляем первое фото с кнопками
+                photo_params = {
+                    "chat_id": admin_group_id,
+                    "photo": review_data['photos'][0],
+                    "caption": caption,
+                    "reply_markup": markup
+                }
+                if topic_id:
+                    photo_params["message_thread_id"] = topic_id
+                    
+                message = bot.send_photo(**photo_params)
+                pending_reviews[review_id]['message_id'] = message.message_id
+                
+                # Остальные фото по отдельности
+                for photo in review_data['photos'][1:]:
+                    single_photo_params = {
+                        "chat_id": admin_group_id,
+                        "photo": photo
+                    }
+                    if topic_id:
+                        single_photo_params["message_thread_id"] = topic_id
+                        
+                    bot.send_photo(**single_photo_params)
         else:
-            message = bot.send_message(
-                chat_id=admin_group_id,
-                text=caption,
-                reply_markup=markup
-            )
+            text_params = {
+                "chat_id": admin_group_id,
+                "text": caption,
+                "reply_markup": markup
+            }
+            if topic_id:
+                text_params["message_thread_id"] = topic_id
+                
+            message = bot.send_message(**text_params)
             pending_reviews[review_id]['message_id'] = message.message_id
             
     except Exception as e:
@@ -314,11 +659,38 @@ def publish_review_to_channel(user_id, review_data):
         )
         
         if review_data.get('photos'):
-            bot.send_photo(
-                chat_id=channel_id,
-                photo=review_data['photos'][0],
+            # Отправляем медиагруппу с фотографиями
+            media = []
+            
+            # Первое фото с caption
+            media.append(types.InputMediaPhoto(
+                review_data['photos'][0], 
                 caption=caption
-            )
+            ))
+            
+            # Остальные фото без caption
+            for photo in review_data['photos'][1:]:
+                media.append(types.InputMediaPhoto(photo))
+            
+            try:
+                bot.send_media_group(
+                    chat_id=channel_id,
+                    media=media
+                )
+            except Exception as e:
+                log_error(logger, e, "Ошибка отправки медиагруппы отзыва в канал")
+                # Fallback: отправляем первое фото с caption
+                bot.send_photo(
+                    chat_id=channel_id,
+                    photo=review_data['photos'][0],
+                    caption=caption
+                )
+                # Остальные фото по отдельности
+                for photo in review_data['photos'][1:]:
+                    bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo
+                    )
         else:
             bot.send_message(
                 chat_id=channel_id,
@@ -379,15 +751,16 @@ def notify_admins_about_order(user_id, product, order_data, order_id, payment_ph
         
         topic_id = create_user_order_topic(user_data)
         
+        price, currency = get_product_price(product)
         order_text = (
             f"🛒 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
             f"👤 Клиент: {user_data['first_name']} {user_data['last_name']}\n"
             f"🔗 {user_data['username']}\n"
             f"🆔 ID: {user_id}\n\n"
-            f"🛍️ Товар: {product[1]}\n"
+            f"🛍️ Товар: {get_product_name(product)}\n"
             f"📏 Размер: {order_data.get('size', 'Не указан')}\n"
-            f"💰 Цена: {product[4] if product[10] else product[3]} {'BS Coin' if product[10] else '₽'}\n"
-            f"🎯 Тип: {'Эксклюзивный (BS Coin)' if product[10] else 'Обычный'}\n\n"
+            f"💰 Цена: {price} {currency}\n"
+            f"🎯 Тип: {'Эксклюзивный (BS Coin)' if get_product_field(product, 'is_exclusive') else 'Обычный'}\n\n"
             f"📦 ДАННЫЕ ДОСТАВКИ:\n"
             f"🏙️ Город: {order_data.get('city', 'Не указан')}\n"
             f"📍 Адрес: {order_data.get('address', 'Не указан')}\n"
@@ -612,6 +985,9 @@ def start(message):
                     db_actions.update_user_stats(user_id, 'bs_coin', 50)
                     db_actions.update_user_stats(user_id, 'discount', 5)
                     
+                    # Проверяем ачивки для рефералов
+                    check_achievement_conditions(referrer_id, 'three_referrals')
+                    
                     bot.send_message(
                         referrer_id,
                         f"🎉 Новый реферал! Вам начислено 100 BS Coin. Теперь у вас {db_actions.get_referral_stats(referrer_id)} рефералов."
@@ -695,22 +1071,62 @@ def show_promo(message):
 @bot.message_handler(func=lambda msg: msg.text == '📢 Отзывы')
 def show_reviews(message):
     user_id = message.from_user.id
-    reviews = db_actions.get_reviews()
     buttons = Bot_inline_btns()
     
-    if not reviews:
-        bot.send_message(user_id, "Пока нет отзывов. Будьте первым!", reply_markup=buttons.reviews_buttons())
-        return
+    try:
+        reviews = db_actions.get_reviews()
         
-    reviews_msg = "🔥 Последние отзывы:\n\n"
-    for review in reviews[:3]:
-        reviews_msg += f"⭐️ {review[2]}\n— {review[5] or review[6]}\n\n"
-    
-    bot.send_message(
-        user_id,
-        reviews_msg,
-        reply_markup=buttons.reviews_buttons()
-    )
+        # Отладочная информация
+        log_info(logger, f"Получено отзывов: {len(reviews) if reviews else 0}")
+        
+        if not reviews or len(reviews) == 0:
+            bot.send_message(user_id, "Пока нет отзывов. Будьте первым!", reply_markup=buttons.reviews_buttons())
+            return
+            
+        reviews_msg = "🔥 Последние отзывы:\n\n"
+        
+        for i, review in enumerate(reviews[:3]):
+            try:
+                log_info(logger, f"Обрабатываем отзыв {i}: {review}, тип: {type(review)}")
+                
+                # Конвертируем review в список, если это возможно
+                if hasattr(review, '__iter__') and not isinstance(review, str):
+                    review_list = list(review)
+                else:
+                    review_list = [review]
+                
+                log_info(logger, f"Отзыв {i} как список: {review_list}, длина: {len(review_list)}")
+                
+                # Безопасное получение данных
+                review_text = "Текст отзыва"
+                user_name = "Пользователь"
+                
+                if len(review_list) > 2:
+                    review_text = str(review_list[2]) if review_list[2] else "Текст отзыва"
+                
+                if len(review_list) > 5:
+                    user_name = str(review_list[5]) if review_list[5] else "Пользователь"
+                
+                reviews_msg += f"⭐️ {review_text}\n— {user_name}\n\n"
+                
+            except Exception as e:
+                log_error(logger, e, f"Ошибка обработки отзыва {i}: {review}")
+                reviews_msg += f"⭐️ Текст отзыва\n— Пользователь\n\n"
+        
+        bot.send_message(
+            user_id,
+            reviews_msg,
+            reply_markup=buttons.reviews_buttons()
+        )
+        
+    except Exception as e:
+        log_error(logger, e, "Ошибка в функции show_reviews")
+        bot.send_message(user_id, "❌ Ошибка при загрузке отзывов", reply_markup=buttons.reviews_buttons())
+
+@bot.message_handler(func=lambda msg: msg.text == '🏆 Ачивки')
+def show_achievements_menu(message):
+    """Показать ачивки через меню"""
+    show_achievements(message)
 
 @bot.message_handler(commands=['my_orders'])
 def my_orders(message):
@@ -726,7 +1142,7 @@ def my_orders(message):
         product = db_actions.get_product(order['product_id'])
         orders_text += (
             f"🛒 Заказ #{order['order_id']}\n"
-            f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
+            f"🛍️ Товар: {get_product_name(product) if product else 'Неизвестно'}\n"
             f"📊 Статус: {order['status']}\n"
             f"🕒 Дата: {order['created_at']}\n\n"
         )
@@ -862,16 +1278,26 @@ def profile(message):
         return
     
     buttons = Bot_inline_btns()
+    
+    # Получаем ачивки пользователя
+    user_achievements = db_actions.get_user_achievements(user_id)
+    
     achievements_str = ""
-    if user_data['achievements']:
-        icons = {"first_order": "🚀", "active_commentator": "💬", "referral_king": "👑"}
-        achievements_str = "\n🏆 Достижения: " + " ".join(
-            [icons.get(a, "🌟") for a in user_data['achievements']]
-        )
+    if user_achievements:
+        achievements_str = "\n🏆 Ваши ачивки:\n"
+        for achievement in user_achievements[:3]:  # Показываем только последние 3
+            achievements_str += f"• {achievement['achievement_name']}\n"
+        
+        if len(user_achievements) > 3:
+            achievements_str += f"... и еще {len(user_achievements) - 3} ачивок\n"
+    else:
+        achievements_str = "\n🏆 Ачивки: Пока нет\n💡 Выполняйте действия в боте для получения ачивок!"
+    
+    achievements_str += "\n\n📖 <a href='https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19'>Подробнее о системе ачивок</a>"
     
     coin_info = ""
     if user_data['bs_coin'] < 100:
-        coin_info = "\n\n💡 Как получить BS Coin:\n• /start - ежедневный бонус\n• /ref - реферальная система\n• Активность в канале"
+        coin_info = "\n\n💡 Как получить BS Coin:\n• /start - ежедневный бонус\n• /ref - реферальная система\n• Активность в канале\n• 🏆 <a href='https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19'>Достижения - подробнее</a>"
     
     profile_msg = (
         f"👤 Ваш профиль:\n\n"
@@ -888,8 +1314,57 @@ def profile(message):
         user_id,
         profile_msg,
         parse_mode="HTML",
+        disable_web_page_preview=True,
         reply_markup=buttons.profile_buttons(user_data)
     )
+
+@bot.message_handler(commands=['achievements'])
+def show_achievements(message):
+    """Показать все ачивки пользователя"""
+    user_id = message.from_user.id
+    
+    user_data = db_actions.get_user_data(user_id)
+    if not user_data:
+        bot.send_message(user_id, "Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    # Получаем ачивки по категориям
+    bridge_achievements = db_actions.get_achievements_by_category(user_id, 'МОСТ')
+    shore_achievements = db_actions.get_achievements_by_category(user_id, 'БЕРЕГ')
+    collective_achievements = db_actions.get_achievements_by_category(user_id, 'КОЛЛЕКТИВ')
+    
+    # Получаем все доступные ачивки
+    all_achievements = db_actions.get_user_achievements(user_id)
+    earned_codes = {ach['achievement_code'] for ach in all_achievements}
+    
+    message_text = "🏆 Система ачивок BridgeSide\n\n"
+    message_text += "Добро пожаловать на свой Берег. Здесь мы отмечаем ваш вклад цифровыми ачивками и внутренней валютой — BS Coin.\n\n"
+    
+    # Линия "МОСТ" — стиль + технологии
+    message_text += "— Линия «МОСТ» — стиль + технологии\n"
+    for code, data in ACHIEVEMENTS.items():
+        if data['category'] == 'МОСТ':
+            status = "✅" if code in earned_codes else "⭕"
+            message_text += f"{status} {data['name']} — {data['description']} → +{data['bs_coin_reward']} BS Coin\n"
+    
+    message_text += "\n— Линия «БЕРЕГ» — лояльность\n"
+    for code, data in ACHIEVEMENTS.items():
+        if data['category'] == 'БЕРЕГ':
+            status = "✅" if code in earned_codes else "⭕"
+            reward_text = f"+{data['bs_coin_reward']} BS Coin"
+            if data['discount_bonus'] > 0:
+                reward_text += f" +{data['discount_bonus']}% скидка"
+            message_text += f"{status} {data['name']} — {data['description']} → {reward_text}\n"
+    
+    message_text += "\n— Линия «КОЛЛЕКТИВ» — за приглашения\n"
+    for code, data in ACHIEVEMENTS.items():
+        if data['category'] == 'КОЛЛЕКТИВ':
+            status = "✅" if code in earned_codes else "⭕"
+            message_text += f"{status} {data['name']} — {data['description']} → +{data['bs_coin_reward']} BS Coin\n"
+    
+    message_text += "\n💡 Выполняйте действия в боте и магазине для получения ачивок!"
+    
+    bot.send_message(user_id, message_text)
 
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
@@ -965,7 +1440,7 @@ def export_products(message):
         
     except Exception as e:
         error_msg = f"❌ Ошибка при экспорте товаров: {str(e)}"
-        print(error_msg)
+        log_error(logger, e, "Ошибка при экспорте товаров")
         bot.send_message(user_id, error_msg)
 
 @bot.message_handler(commands=['upload_products'])
@@ -978,6 +1453,111 @@ def upload_products(message):
     bot.send_message(user_id, "📤 Отправьте Excel файл с товарами")
     bot.register_next_step_handler(message, process_products_file)
 
+@bot.message_handler(commands=['yadisk_auth'])
+def yadisk_auth(message):
+    """Инициировать авторизацию Яндекс.Диска"""
+    user_id = message.from_user.id
+    if not db_actions.user_is_admin(user_id):
+        bot.send_message(user_id, "⛔️ Недостаточно прав")
+        return
+    
+    cfg = config.get_config()
+    yadisk_config = cfg.get('yadisk', {})
+    client_id = yadisk_config.get('client_id')
+    
+    if not client_id:
+        bot.send_message(user_id, 
+            "❌ Не настроен client_id для Яндекс.Диска.\n"
+            "Добавьте в secrets.json:\n"
+            '```json\n'
+            '{\n'
+            '  "yadisk": {\n'
+            '    "client_id": "ваш_client_id",\n'
+            '    "client_secret": "ваш_client_secret"\n'
+            '  }\n'
+            '}\n'
+            '```', parse_mode='Markdown')
+        return
+    
+    # Генерируем state для безопасности
+    state = f"yadisk_auth_{user_id}_{int(time.time())}"
+    
+    # Сохраняем state для проверки
+    if user_id not in temp_data:
+        temp_data[user_id] = {}
+    temp_data[user_id]['yadisk_state'] = state
+    
+    # Формируем URL авторизации
+    auth_url = (
+        f"{YANDEX_OAUTH_URL}?"
+        f"response_type=code&"
+        f"client_id={client_id}&"
+        f"state={state}"
+    )
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔗 Авторизоваться", url=auth_url))
+    
+    bot.send_message(user_id,
+        "🔐 Для авторизации Яндекс.Диска:\n\n"
+        "1. Нажмите кнопку ниже\n"
+        "2. Войдите в аккаунт Яндекс\n"
+        "3. Разрешите доступ приложению\n"
+        "4. Скопируйте код из адресной строки\n"
+        "5. Отправьте код боту\n\n"
+        f"State: `{state}`", 
+        reply_markup=markup, parse_mode='Markdown')
+    
+    temp_data[user_id]['step'] = 'await_yadisk_code'
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'await_yadisk_code')
+def handle_yadisk_code(message):
+    """Обработать код авторизации от Яндекс.Диска"""
+    user_id = message.from_user.id
+    data = temp_data.get(user_id, {})
+    
+    if 'yadisk_state' not in data:
+        bot.send_message(user_id, "❌ Сессия неактуальна. Используйте /yadisk_auth")
+        return
+    
+    code = message.text.strip()
+    state = data['yadisk_state']
+    
+    try:
+        # Обмениваем код на токены
+        cfg = config.get_config()
+        yadisk_config = cfg.get('yadisk', {})
+        client_id = yadisk_config.get('client_id')
+        client_secret = yadisk_config.get('client_secret')
+        
+        token_data = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'client_id': client_id,
+            'client_secret': client_secret
+        }
+        
+        response = requests.post(YANDEX_TOKEN_URL, data=token_data, timeout=30)
+        response.raise_for_status()
+        tokens = response.json()
+        
+        # Сохраняем токены
+        config.update_yadisk_tokens(
+            tokens['access_token'],
+            tokens.get('refresh_token', ''),
+            tokens.get('expires_in', 3600)
+        )
+        
+        bot.send_message(user_id, "✅ Авторизация Яндекс.Диска успешна!")
+        
+        # Очищаем временные данные
+        if user_id in temp_data:
+            del temp_data[user_id]
+            
+    except Exception as e:
+        log_error(logger, e, "Ошибка авторизации Яндекс.Диска")
+        bot.send_message(user_id, f"❌ Ошибка авторизации: {str(e)}")
+
 @bot.message_handler(commands=['create_post'])
 def create_post(message):
     user_id = message.from_user.id
@@ -988,23 +1568,140 @@ def create_post(message):
     if user_id in temp_data:
         del temp_data[user_id]
     
-    temp_data[user_id] = {
-        'step': 'select_product',
-        'photos': []
-    }
-    
-    products = db_actions.get_products(limit=50)
-    buttons = Bot_inline_btns()
-    
-    if not products:
-        bot.send_message(user_id, "❌ Нет товаров для публикации")
+    temp_data[user_id] = {'step': 'await_product_id', 'photos': []}
+    # Отправляем последнюю xlsx (если есть)
+    try:
+        xlsx_path = config.get_config().get('xlsx_path')
+        if xlsx_path and os.path.exists(os.path.join(work_dir, xlsx_path)):
+            with open(os.path.join(work_dir, xlsx_path), 'rb') as f:
+                bot.send_document(user_id, f, caption="📄 Актуальная таблица товаров (содержит ID)")
+    except Exception as e:
+        log_error(logger, e, "Не удалось отправить XLSX")
+    bot.send_message(user_id, "✍️ Введите ID товара из таблицы (совпадает с папкой на Яндекс.Диске):")
+    bot.register_next_step_handler(message, handle_enter_product_id)
+
+def handle_enter_product_id(message):
+    user_id = message.from_user.id
+    if user_id not in temp_data or temp_data[user_id].get('step') != 'await_product_id':
+        bot.send_message(user_id, "❌ Сессия неактуальна. Нажмите /create_post")
         return
-        
-    bot.send_message(
-        user_id,
-        "📦 Выберите товар для публикации в канал:",
-        reply_markup=buttons.post_products_buttons(products)
-    )
+    product_id = message.text.strip()
+    # Скачиваем фото
+    try:
+        photos = download_photos_from_yadisk(product_id)
+        if not photos:
+            bot.send_message(user_id, "❌ Фото не найдены на Яндекс.Диске")
+            return
+        temp_data[user_id]['photos'] = photos
+        temp_data[user_id]['product_id'] = product_id
+        # Получим товар для описания
+        product = db_actions.get_product(int(product_id)) if product_id.isdigit() else None
+        name = get_product_name(product) if product else f"Товар {product_id}"
+        price, currency = (get_product_field(product, 'price', 0) if product else 0, '₽') if product else (0, '₽')
+        desc = get_product_field(product, 'description', '') if product else ''
+        caption = f"🛍️ {name}\n\n📝 {desc}\n💰 Цена: {price}{currency}"
+        # Превью: отправим медиа-группу (до 10 фото)
+        media = []
+        for idx, p in enumerate(photos[:10]):
+            if idx == 0:
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption))
+            else:
+                media.append(types.InputMediaPhoto(open(p, 'rb')))
+        bot.send_media_group(user_id, media)
+        # Кнопки
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(text="🚀 Выложить", callback_data=f"post_publish_{product_id}"),
+            types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"post_edit_{product_id}")
+        )
+        markup.add(types.InlineKeyboardButton(text="❌ Отменить", callback_data=f"post_cancel_{product_id}"))
+        bot.send_message(user_id, "Предпросмотр поста. Что делаем?", reply_markup=markup)
+        temp_data[user_id]['step'] = 'preview'
+    except Exception as e:
+        log_error(logger, e, "Ошибка при скачивании фото с Я.Диска")
+        bot.send_message(user_id, "❌ Не удалось скачать фото с Яндекс.Диска")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('post_cancel_'))
+def handle_post_cancel(call):
+    user_id = call.from_user.id
+    files = temp_data.get(user_id, {}).get('photos', [])
+    cleanup_local_files(files)
+    if user_id in temp_data:
+        del temp_data[user_id]
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text="Операция отменена")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('post_publish_'))
+def handle_post_publish(call):
+    user_id = call.from_user.id
+    data = temp_data.get(user_id) or {}
+    files = data.get('photos', [])
+    product_id = data.get('product_id')
+    try:
+        if not files:
+            bot.answer_callback_query(call.id, "Нет файлов для публикации")
+            return
+        # Формируем подпись из сохранённых значений
+        product = db_actions.get_product(int(product_id)) if product_id and str(product_id).isdigit() else None
+        name = get_product_name(product) if product else f"Товар {product_id}"
+        price, currency = (get_product_field(product, 'price', 0) if product else 0, '₽') if product else (0, '₽')
+        desc = get_product_field(product, 'description', '') if product else ''
+        caption = f"🛍️ {name}\n\n📝 {desc}\n💰 Цена: {price}{currency}"
+        config_data_local = config.get_config()
+        chat_id = config_data_local.get('store_channel_id', '@BridgeSide_Store')
+        topic_id = (config_data_local.get('topics') or {}).get('магазин')
+        media = []
+        for idx, p in enumerate(files[:10]):
+            if idx == 0:
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption))
+            else:
+                media.append(types.InputMediaPhoto(open(p, 'rb')))
+        # Публикация
+        bot.send_media_group(chat_id, media, message_thread_id=topic_id)
+        bot.answer_callback_query(call.id, "Опубликовано")
+        bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text="✅ Пост опубликован")
+    except Exception as e:
+        log_error(logger, e, "Ошибка публикации поста")
+        bot.answer_callback_query(call.id, "Ошибка публикации")
+    finally:
+        cleanup_local_files(files)
+        if user_id in temp_data:
+            del temp_data[user_id]
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('post_edit_'))
+def handle_post_edit(call):
+    user_id = call.from_user.id
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id,
+                          text="Отправьте новый текст поста (будет в подписи первого фото)")
+    temp_data[user_id]['step'] = 'edit_text'
+    temp_data[user_id]['edit_message_id'] = call.message.message_id
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_text')
+def handle_new_caption(message):
+    user_id = message.from_user.id
+    data = temp_data.get(user_id) or {}
+    files = data.get('photos', [])
+    new_caption = message.text
+    # Покажем обновлённый предпросмотр
+    try:
+        media = []
+        for idx, p in enumerate(files[:10]):
+            if idx == 0:
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=new_caption))
+            else:
+                media.append(types.InputMediaPhoto(open(p, 'rb')))
+        bot.send_media_group(user_id, media)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(text="🚀 Выложить", callback_data=f"post_publish_{data.get('product_id')}")
+        )
+        markup.add(types.InlineKeyboardButton(text="❌ Отменить", callback_data=f"post_cancel_{data.get('product_id')}") )
+        bot.send_message(user_id, "Готово к публикации", reply_markup=markup)
+        temp_data[user_id]['step'] = 'preview'
+    except Exception as e:
+        log_error(logger, e, "Ошибка предпросмотра после редактирования")
+        bot.send_message(user_id, "❌ Ошибка предпросмотра")
 
 @bot.message_handler(commands=['export_users'])
 def export_users(message):
@@ -1028,26 +1725,6 @@ def export_users(message):
     
     os.remove(filename)
 
-@bot.message_handler(commands=['exclusive'])
-def exclusive_products(message):
-    user_id = message.from_user.id
-        
-    products = db_actions.get_exclusive_products(limit=10)
-    buttons = Bot_inline_btns()
-    
-    if not products:
-        bot.send_message(user_id, "Эксклюзивных товаров пока нет")
-        return
-        
-    products_msg = "🎯 Эксклюзивные товары (только за BS Coin):\n\n"
-    for product in products:
-        products_msg += f"{product[1]} - {product[4]} BS Coin\n"
-    
-    bot.send_message(
-        user_id,
-        products_msg,
-        reply_markup=buttons.exclusive_products_buttons(products)
-    )
 
 @bot.message_handler(commands=['order_status'])
 def order_status_command(message):
@@ -1100,8 +1777,8 @@ def order_status_command(message):
                         order_info['user_id'],
                         f"📦 Статус вашего заказа #{order_id} изменен:\n"
                         f"🔄 {status_display}\n\n"
-                        f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
-                        f"💰 Сумма: {product[3] if product else '0'}₽"
+                        f"🛍️ Товар: {get_product_name(product) if product else 'Неизвестно'}\n"
+                        f"💰 Сумма: {get_product_field(product, 'price', 0) if product else '0'}₽"
                     )
                 except Exception as e:
                     print(f"Ошибка уведомления пользователя: {e}")
@@ -1146,7 +1823,7 @@ def list_orders(message):
         orders_text += (
             f"🛒 Заказ #{order['order_id']}\n"
             f"👤 {user_data['first_name']} {user_data['last_name']}\n"
-            f"🛍️ {product[1] if product else 'Неизвестно'}\n"
+            f"🛍️ {get_product_name(product) if product else 'Неизвестно'}\n"
             f"📊 Статус: {order['status']}\n"
             f"🕒 {order['created_at']}\n"
             f"🔗 /order_info_{order['order_id']}\n\n"
@@ -1180,8 +1857,8 @@ def order_info(message):
             f"• @{user_data['username']}\n"
             f"• ID: {user_data['user_id']}\n\n"
             f"🛍️ ТОВАР:\n"
-            f"• {product[1] if product else 'Неизвестно'}\n"
-            f"• Цена: {product[3] if product else '0'}₽\n\n"
+            f"• {get_product_name(product) if product else 'Неизвестно'}\n"
+            f"• Цена: {get_product_field(product, 'price', 0) if product else '0'}₽\n\n"
             f"📦 ДОСТАВКА:\n"
             f"• Город: {order_info['city']}\n"
             f"• Адрес: {order_info['address']}\n"
@@ -1277,25 +1954,38 @@ def process_product_price(message, photo_id, name, desc):
     try:
         price = float(message.text)
         
-        markup = types.InlineKeyboardMarkup()
-        btn_yes = types.InlineKeyboardButton("Да", callback_data="exclusive_yes")
-        btn_no = types.InlineKeyboardButton("Нет", callback_data="exclusive_no")
-        markup.add(btn_yes, btn_no)
-        
-        msg = bot.send_message(
-            message.chat.id,
-            "🎯 Это эксклюзивный товар (только за BS Coin)?",
-            reply_markup=markup
-        )
-    
         user_id = message.from_user.id
         temp_data[user_id] = {
             'name': name,
             'description': desc,
             'price': price,
             'photo_id': photo_id,
-            'step': 'ask_exclusive'
+            'step': 'ready_to_save'
         }
+        
+        # Сразу сохраняем товар
+        product_id = db_actions.add_product(
+            name=name,
+            description=desc,
+            price=price,
+            price_yuan=0,
+            photo_id=photo_id,
+            category="магазин"
+        )
+        
+        if product_id:
+            bot.send_message(
+                message.chat.id,
+                f"✅ Товар «{name}» успешно добавлен!\n"
+                f"💰 Цена: {price}₽\n"
+                f"🆔 ID: {product_id}"
+            )
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка при добавлении товара")
+            
+        # Очищаем временные данные
+        if user_id in temp_data:
+            del temp_data[user_id]
             
     except ValueError:
         bot.send_message(message.chat.id, "❌ Неверный формат цены. Используйте только числа")
@@ -1330,6 +2020,8 @@ def exchange_coin(call):
             [icons.get(a, "🌟") for a in user_data['achievements']]
         )
     
+    achievements_str += "\n\n📖 [Подробнее о системе ачивок](https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19)"
+    
     profile_msg = (
         f"👤 Ваш профиль:\n\n"
         f"🆔 ID: <code>{user_data['user_id']}</code>\n"
@@ -1351,76 +2043,6 @@ def exchange_coin(call):
     
     bot.send_message(user_id, "🎉 Поздравляем! Вы обменяли 500 BS Coin на 5% скидки")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('buy_coin_'))
-def buy_product_with_coins(call):
-    user_id = call.from_user.id
-
-    try:
-        product_id = int(call.data.split('_')[2])
-    except (IndexError, ValueError):
-        bot.answer_callback_query(call.id, "❌ Ошибка: неверный формат запроса")
-        return
-        
-    product = db_actions.get_product(product_id)
-    user_data = db_actions.get_user_data(user_id)
-    
-    if not user_data:
-        bot.answer_callback_query(call.id, "Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    if not product or not product[10]:
-        bot.answer_callback_query(call.id, "Товар не найден или не является эксклюзивным")
-        return
-    
-    coin_price = product[4]
-    
-    if user_data['bs_coin'] < coin_price:
-        bot.answer_callback_query(call.id, f"❌ Недостаточно BS Coin!")
-        
-        buttons = Bot_inline_btns()
-        markup = types.InlineKeyboardMarkup()
-        
-        btn1 = types.InlineKeyboardButton(
-            text="💎 Получить BS Coin",
-            callback_data="how_to_get_coins"
-        )
-        btn2 = types.InlineKeyboardButton(
-            text="🔙 Назад к товару",
-            callback_data=f"product_{product_id}"
-        )
-        markup.add(btn1, btn2)
-        
-        bot.send_message(
-            user_id,
-            f"❌ Недостаточно BS Coin для покупки!\n\n"
-            f"💎 Нужно: {coin_price} BS Coin\n"
-            f"💰 У вас: {user_data['bs_coin']} BS Coin\n"
-            f"📊 Не хватает: {coin_price - user_data['bs_coin']} BS Coin\n\n"
-            f"💡 Вы можете получить BS Coin через:\n"
-            f"• Ежедневный бонус (/start)\n"
-            f"• Реферальную систему (/ref)\n"
-            f"• Активность в канале",
-            reply_markup=markup
-        )
-        return
-    
-    db_actions.create_order(user_id, product_id, 1)
-    db_actions.update_user_stats(user_id, 'bs_coin', -coin_price)
-    db_actions.update_user_stats(user_id, 'orders', 1)
-    
-    if user_data['orders'] == 0:
-        db_actions.add_achievement(user_id, "first_order")
-        db_actions.update_user_stats(user_id, 'bs_coin', 50)
-        bot.send_message(
-            user_id,
-            "🎉 Вы получили достижение «Первый заказ» +50 BS Coin!"
-        )
-    
-    bot.answer_callback_query(call.id, "Заказ оформлен!")
-    bot.send_message(
-        user_id,
-        f"✅ Ваш заказ оформлен! Списано {coin_price} BS Coin. Ожидайте информацию о доставке."
-    )
 
 @bot.callback_query_handler(func=lambda call: call.data == 'how_to_get_coins')
 def how_to_get_coins(call):
@@ -1446,6 +2068,7 @@ def how_to_get_coins(call):
             f"2. 👥 Реферальная система: +100 BS Coin за каждого приглашенного друга (/ref)\n"
             f"3. 💬 Активность в канале: комментируйте посты и получайте монеты\n"
             f"4. 🏆 Достижения: выполняйте задания и получайте бонусы\n\n"
+            f"📖 [Подробнее о системе ачивок](https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19)\n\n"
             f"💰 Ваш текущий баланс: {user_data['bs_coin']} BS Coin",
         reply_markup=markup
     )
@@ -1497,106 +2120,11 @@ def ref_link(call):
         )
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data in ['exclusive_yes', 'exclusive_no'])
-def process_exclusive(call):
-    user_id = call.from_user.id
-    is_exclusive = (call.data == 'exclusive_yes')
-    
-    if user_id not in temp_data or temp_data[user_id]['step'] != 'ask_exclusive':
-        bot.answer_callback_query(call.id, "Ошибка процесса. Начните заново.")
-        return
-    
-    temp_data[user_id]['is_exclusive'] = is_exclusive
-    temp_data[user_id]['step'] = 'ask_coin_price' if is_exclusive else 'ready_to_save'
-    
-    if is_exclusive:
-        bot.edit_message_text(
-            chat_id=user_id,
-            message_id=call.message.message_id,
-            text="💎 Укажите цену в BS Coin:"
-        )
-        bot.register_next_step_handler(call.message, process_coin_price)
-    else:
-        product_data = temp_data[user_id]
-        product_id = db_actions.add_product(
-            name=product_data['name'],
-            description=product_data['description'],
-            price=product_data['price'],
-            photo_id=product_data['photo_id'],
-            is_exclusive=False,
-            coin_price=0
-        )
-        
-        product_data['product_id'] = product_id
-        post_link = publish_product_to_channel(product_data)
-        
-        if post_link:
-            bot.send_message(
-                user_id,
-                f"✅ Товар успешно добавлен и опубликован!\nСсылка: {post_link}",
-                disable_web_page_preview=True
-            )
-        else:
-            bot.send_message(user_id, "✅ Товар добавлен, но не опубликован")
-        
-        if user_id in temp_data:
-            del temp_data[user_id]
-
-def process_coin_price(message):
-    user_id = message.from_user.id
-    
-    if user_id not in temp_data or temp_data[user_id]['step'] != 'ask_coin_price':
-        bot.send_message(user_id, "Ошибка процесса. Начните заново.")
-        return
-    
-    try:
-        coin_price = int(message.text)
-        if coin_price <= 0:
-            raise ValueError("Цена должна быть положительной")
-        
-        product_data = temp_data[user_id]
-        product_id = db_actions.add_product(
-            name=product_data['name'],
-            description=product_data['description'],
-            price=product_data['price'],
-            photo_id=product_data['photo_id'],
-            is_exclusive=True,
-            coin_price=coin_price
-        )
-        
-        if not product_id:
-            raise Exception("Не удалось добавить товар в базу данных")
-        
-        product_data['product_id'] = product_id
-        product_data['coin_price'] = coin_price
-        product_data['is_exclusive'] = True
-        post_link = publish_product_to_channel(product_data)
-        
-        if post_link:
-            bot.send_message(
-                user_id,
-                f"✅ Эксклюзивный товар успешно добавлен и опубликован!\nСсылка: {post_link}",
-                disable_web_page_preview=True
-            )
-        else:
-            bot.send_message(user_id, "✅ Товар добавлен, но не опубликован")
-        
-        if user_id in temp_data:
-            del temp_data[user_id]
-            
-    except ValueError:
-        bot.send_message(user_id, "❌ Неверный формат цены. Используйте только целые числа.")
-        msg = bot.send_message(user_id, "💎 Укажите цену в BS Coin:")
-        bot.register_next_step_handler(msg, process_coin_price)
-    except Exception as e:
-        bot.send_message(user_id, f"❌ Ошибка при добавлении товара: {str(e)}")
-        if user_id in temp_data:
-            del temp_data[user_id]
 
 def publish_product_to_channel(product):
     try:
         if not product.get('product_id'):
-            print("Ошибка: product_id не определен")
+            log_error(logger, "product_id не определен")
             return None
             
         config_data = config.get_config()
@@ -1609,21 +2137,12 @@ def publish_product_to_channel(product):
         buy_btn = types.InlineKeyboardButton(text="🛒 Купить", url=deep_link)
         markup.add(buy_btn)
         
-        if product.get('is_exclusive'):
-            caption = (
-                f"🎯 ЭКСКЛЮЗИВНЫЙ ТОВАР\n\n"
-                f"🛍️ {product['name']}\n\n"
-                f"📝 {product['description']}\n"
-                f"💎 Цена: {product['coin_price']} BS Coin\n\n"
-                f"👉 Нажмите «🛒 Купить» для заказа через бота"
-            )
-        else:
-            caption = (
-                f"🛍️ {product['name']}\n\n"
-                f"📝 {product['description']}\n"
-                f"💰 Цена: {product['price']}₽\n\n"
-                f"👉 Нажмите «🛒 Купить» для заказа через бота"
-            )
+        caption = (
+            f"🛍️ {product['name']}\n\n"
+            f"📝 {product['description']}\n"
+            f"💰 Цена: {product['price']}₽\n\n"
+            f"👉 Нажмите «🛒 Купить» для заказа через бота"
+        )
         
         message = bot.send_photo(
             chat_id=chat_id,
@@ -1656,12 +2175,12 @@ def select_product_for_post(call):
         
     temp_data[user_id]['product_id'] = product_id
     temp_data[user_id]['step'] = 'add_photos'
-    temp_data[user_id]['product_name'] = product[1]
+    temp_data[user_id]['product_name'] = get_product_name(product)
     
     bot.edit_message_text(
         chat_id=user_id,
         message_id=call.message.message_id,
-        text=f"📦 Выбран товар: {product[1]}\n\n"
+        text=f"📦 Выбран товар: {get_product_name(product)}\n\n"
             f"📸 Теперь отправьте до 6 фотографий товара\n"
             f"📝 После отправки фото напишите текст для поста\n"
             f"❌ Отправьте /cancel для отмены"
@@ -1725,7 +2244,7 @@ def handle_exclusive_post(call):
                     text=f"✅ Товар успешно опубликован в @BridgeSide_Store\n\n"
                         f"🛍️ Товар: {temp_data[user_id].get('product_name', 'Неизвестно')}\n"
                         f"🎯 Статус: Обычный (рубли)\n"
-                        f"💰 Цена: {product[3]}₽"
+                        f"💰 Цена: {get_product_field(product, 'price', 0)}₽"
                 )
             else:
                 bot.answer_callback_query(call.id, "❌ Ошибка публикации")
@@ -1824,20 +2343,20 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
     try:
         product = db_actions.get_product(product_id)
         if not product:
-            print("❌ Товар не найден")
+            log_error(logger, "Товар не найден")
             return False
             
         config_data = config.get_config()
         channel_id = config_data.get('store_channel_id', '@BridgeSide_Store')
         
         if not channel_id:
-            print("❌ Не указан channel_id в конфиге")
+            log_error(logger, "Не указан channel_id в конфиге")
             return False
         
         deep_link = f"https://t.me/{bot.get_me().username}?start=product_{product_id}"
         
         if not is_exclusive:
-            price_text = f"💰 Цена: {product[3]}₽"
+            price_text = f"💰 Цена: {get_product_field(product, 'price', 0)}₽"
         else:
             price_text = f"💎 Цена: {coin_price} BS Coin"
         
@@ -1937,22 +2456,13 @@ def handle_post_creation(message):
         if user_id in temp_data:
             del temp_data[user_id]
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('size_', 'size_coin_')))
+@bot.callback_query_handler(func=lambda call: call.data.startswith('size_'))
 def handle_size_selection(call):
     user_id = call.from_user.id
     try:
         parts = call.data.split('_')
-        
-        is_exclusive = parts[0] == 'size_coin'
-        
-        if is_exclusive:
-            product_id = int(parts[2])
-            size = parts[3]
-        else:
-            product_id = int(parts[1])
-            size = parts[2]
-        
-        print(f"DEBUG: Выбран размер - product_id: {product_id}, size: '{size}', exclusive: {is_exclusive}")
+        product_id = int(parts[1])
+        size = parts[2]
         
         # Проверяем доступность размера
         if not db_actions.check_size_availability(product_id, size):
@@ -1965,7 +2475,6 @@ def handle_size_selection(call):
         
         temp_data[user_id]['selected_product'] = product_id
         temp_data[user_id]['selected_size'] = size
-        temp_data[user_id]['is_exclusive'] = is_exclusive
         
         # Получаем информацию о товаре
         product = db_actions.get_product(product_id)
@@ -1973,31 +2482,13 @@ def handle_size_selection(call):
             bot.answer_callback_query(call.id, "❌ Товар не найден")
             return
         
-        # Создаем кнопку в зависимости от типа товара
+        # Создаем кнопку заказа
         markup = types.InlineKeyboardMarkup()
-        
-        if is_exclusive:
-            # Для эксклюзивных товаров - кнопка покупки за BS Coin
-            user_data = db_actions.get_user_data(user_id)
-            if user_data and user_data['bs_coin'] >= product[4]:
-                buy_btn = types.InlineKeyboardButton(
-                    text=f"💎 Купить за {product[4]} BS Coin",
-                    callback_data=f"buy_coin_{product_id}_{size}"
-                )
-                markup.add(buy_btn)
-            else:
-                buy_btn = types.InlineKeyboardButton(
-                    text=f"❌ Недостаточно BS Coin",
-                    callback_data="how_to_get_coins"
-                )
-                markup.add(buy_btn)
-        else:
-            # Для обычных товаров - кнопка "Заказать сейчас"
-            order_btn = types.InlineKeyboardButton(
-                text="🛒 Заказать сейчас",
-                callback_data=f"order_{product_id}_{size}"
-            )
-            markup.add(order_btn)
+        order_btn = types.InlineKeyboardButton(
+            text="🛒 Заказать сейчас",
+            callback_data=f"order_{product_id}_{size}"
+        )
+        markup.add(order_btn)
         
         # Обновляем сообщение
         try:
@@ -2019,11 +2510,11 @@ def handle_size_selection(call):
             bot.answer_callback_query(call.id, f"✅ Выбран размер: {size}")
             
         except Exception as e:
-            print(f"Ошибка редактирования: {e}")
+            log_error(logger, e, "Ошибка редактирования")
             bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
                 
     except Exception as e:
-        print(f"Ошибка в handle_size_selection: {e}")
+        log_error(logger, e, "Ошибка в handle_size_selection")
         bot.answer_callback_query(call.id, "❌ Ошибка выбора размера")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('order_'))
@@ -2133,14 +2624,13 @@ def ask_delivery_type(message):
     product = db_actions.get_product(product_id)
     
     if product:
-        price = product[4] if product[10] else product[3]
-        currency = 'BS Coin' if product[10] else '₽'
+        price, currency = get_product_price(product)
         
         # Показываем сводку по заказу
         order_summary = (
             f"✅ Данные доставки получены!\n\n"
             f"📋 Ваш заказ:\n"
-            f"🛍️ Товар: {product[1]}\n"
+            f"🛍️ Товар: {get_product_name(product)}\n"
             f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
             f"💰 Цена: {price} {currency}\n\n"
             f"📦 Доставка:\n"
@@ -2172,13 +2662,12 @@ def process_payment_photo(message):
         product = db_actions.get_product(product_id)
         
         if product:
-            price = product[4] if product[10] else product[3]
-            currency = 'BS Coin' if product[10] else '₽'
+            price, currency = get_product_price(product)
             
             order_summary = (
                 f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
                 f"📋 Ваш заказ:\n"
-                f"🛍️ Товар: {product[1]}\n"
+                f"🛍️ Товар: {get_product_name(product)}\n"
                 f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
                 f"💰 Цена: {price} {currency}\n\n"
                 f"📦 Доставка:\n"
@@ -2257,6 +2746,9 @@ def confirm_order_final(message):
             
             # Обновляем статистику пользователя
             db_actions.update_user_stats(user_id, 'orders', 1)
+            
+            # Проверяем ачивки
+            check_achievement_conditions(user_id, 'first_purchase')
             
             # Проверяем достижение первого заказа
             user_data = db_actions.get_user_data(user_id)
@@ -2348,13 +2840,12 @@ def show_order_confirmation(user_id):
     product = db_actions.get_product(product_id)
     
     if product:
-        price = product[4] if product[10] else product[3]
-        currency = 'BS Coin' if product[10] else '₽'
+        price, currency = get_product_price(product)
         
         order_summary = (
             f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
             f"📋 Ваш заказ:\n"
-            f"🛍️ Товар: {product[1]}\n"
+            f"🛍️ Товар: {get_product_name(product)}\n"
             f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
             f"💰 Цена: {price} {currency}\n\n"
             f"📦 Доставка:\n"
@@ -2549,6 +3040,9 @@ def handle_review_moderation(call):
                 photos_json
             )
             
+            # Проверяем ачивки для отзыва
+            check_achievement_conditions(user_id, 'first_review_with_photo')
+            
             publish_review_to_channel(user_id, review_data)
             
             bot.answer_callback_query(call.id, "✅ Отзыв одобрен")
@@ -2684,17 +3178,17 @@ def handle_topic_reply(message):
             bot.send_message(
                 order_info['user_id'],
                 f"❌ Ваш заказ #{order_id} отклонен\n\n"
-                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
-                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
+                f"🛍️ Товар: {get_product_name(product) if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {get_product_field(product, 'price', 0) if product else '0'}₽\n\n"
                 f"📝 Причина: {reason}\n\n"
                 f"💬 Если у вас есть вопросы, обратитесь в поддержку."
             )
             
-            if product and product[10]:
-                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', product[4])
+            if product and get_product_field(product, 'is_exclusive'):
+                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', get_product_field(product, 'coin_price', 0))
                 bot.send_message(
                     order_info['user_id'],
-                    f"💎 Вам возвращено {product[4]} BS Coin"
+                    f"💎 Вам возвращено {get_product_field(product, 'coin_price', 0)} BS Coin"
                 )
         except Exception as e:
             print(f"Ошибка уведомления пользователя: {e}")
@@ -2777,8 +3271,8 @@ def handle_order_approval(call):
             bot.send_message(
                 order_info['user_id'],
                 f"🎉 Ваш заказ #{order_id} подтвержден!\n\n"
-                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
-                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
+                f"🛍️ Товар: {get_product_name(product) if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {get_product_field(product, 'price', 0) if product else '0'}₽\n\n"
                 f"📦 Заказ передан в обработку. Ожидайте информацию о доставке."
             )
         except Exception as e:
@@ -2824,7 +3318,7 @@ def process_reject_reason_in_topic(message):
         product = db_actions.get_product(order_info['product_id'])
         
         if not user_data or not product:
-            print("Данные пользователя или товара не найдены")
+            log_error(logger, "Данные пользователя или товара не найдены")
             return
         
 
@@ -2835,8 +3329,8 @@ def process_reject_reason_in_topic(message):
             f"🛒 ЗАКАЗ #{order_id} ❌ ОТКЛОНЕН\n\n"
             f"👤 Клиент: {user_data['first_name']} {user_data['last_name']}\n"
             f"🔗 @{user_data['username']}\n"
-            f"🛍️ Товар: {product[1]}\n"
-            f"💰 Цена: {product[3]}₽\n\n"
+            f"🛍️ Товар: {get_product_name(product)}\n"
+            f"💰 Цена: {get_product_field(product, 'price', 0)}₽\n\n"
             f"📦 ДАННЫЕ ДОСТАВКИ:\n"
             f"🏙️ Город: {order_info.get('city', 'Не указан')}\n"
             f"📍 Адрес: {order_info.get('address', 'Не указан')}\n"
@@ -2870,17 +3364,17 @@ def process_reject_reason_in_topic(message):
             bot.send_message(
                 order_info['user_id'],
                 f"❌ Ваш заказ #{order_id} отклонен\n\n"
-                f"🛍️ Товар: {product[1]}\n"
-                f"💰 Сумма: {product[3]}₽\n\n"
+                f"🛍️ Товар: {get_product_name(product)}\n"
+                f"💰 Сумма: {get_product_field(product, 'price', 0)}₽\n\n"
                 f"📝 Причина: {reason}\n\n"
                 f"💬 Если у вас есть вопросы, обратитесь в поддержку."
             )
             
-            if product[10]:  # is_exclusive
-                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', product[4])
+            if get_product_field(product, 'is_exclusive'):  # is_exclusive
+                db_actions.update_user_stats(order_info['user_id'], 'bs_coin', get_product_field(product, 'coin_price', 0))
                 bot.send_message(
                     order_info['user_id'],
-                    f"💎 Вам возвращено {product[4]} BS Coin"
+                    f"💎 Вам возвращено {get_product_field(product, 'coin_price', 0)} BS Coin"
                 )
         except Exception as e:
             print(f"Ошибка уведомления пользователя: {e}")
@@ -2921,14 +3415,13 @@ def process_custom_delivery(message):
     product = db_actions.get_product(product_id)
     
     if product:
-        price = product[4] if product[10] else product[3]
-        currency = 'BS Coin' if product[10] else '₽'
+        price, currency = get_product_price(product)
         
 
         order_summary = (
             f"✅ Данные доставки получены!\n\n"
             f"📋 Ваш заказ:\n"
-            f"🛍️ Товар: {product[1]}\n"
+            f"🛍️ Товар: {get_product_name(product)}\n"
             f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
             f"💰 Цена: {price} {currency}\n\n"
             f"📦 Доставка:\n"
@@ -3017,18 +3510,18 @@ def handle_reject_reason(message):
             bot.send_message(
                 user_id_from_order,
                 f"❌ Ваш заказ #{order_id} отклонен\n\n"
-                f"🛍️ Товар: {product[1] if product else 'Неизвестно'}\n"
-                f"💰 Сумма: {product[3] if product else '0'}₽\n\n"
+                f"🛍️ Товар: {get_product_name(product) if product else 'Неизвестно'}\n"
+                f"💰 Сумма: {get_product_field(product, 'price', 0) if product else '0'}₽\n\n"
                 f"📝 Причина: {reason}\n\n"
                 f"💬 Если у вас есть вопросы, обратитесь в поддержку."
             )
             
 
-            if product and product[10]:
-                db_actions.update_user_stats(user_id_from_order, 'bs_coin', product[4])
+            if product and get_product_field(product, 'is_exclusive'):
+                db_actions.update_user_stats(user_id_from_order, 'bs_coin', get_product_field(product, 'coin_price', 0))
                 bot.send_message(
                     user_id_from_order,
-                    f"💎 Вам возвращено {product[4]} BS Coin"
+                    f"💎 Вам возвращено {get_product_field(product, 'coin_price', 0)} BS Coin"
                 )
         except Exception as e:
             print(f"Ошибка уведомления пользователя: {e}")
@@ -3064,9 +3557,9 @@ def process_payment_photo(message):
             order_summary = (
                 f"✅ ВСЕ ДАННЫЕ ПОЛУЧЕНЫ!\n\n"
                 f"📋 Ваш заказ:\n"
-                f"🛍️ Товар: {product[1]}\n"
+                f"🛍️ Товар: {get_product_name(product)}\n"
                 f"📏 Размер: {temp_data[user_id]['order'].get('size', 'Не указан')}\n"
-                f"💰 Цена: {product[3]}₽\n\n"
+                f"💰 Цена: {get_product_field(product, 'price', 0)}₽\n\n"
                 f"📦 Доставка:\n{temp_data[user_id]['order']['delivery_info']}\n\n"
                 f"📸 Фото оплаты приложено\n\n"
                 f"Выберите действие:"
@@ -3115,6 +3608,9 @@ def handle_review_moderation(call):
                 review_data['text'], 
                 photos_json
             )
+            
+            # Проверяем ачивки для отзыва
+            check_achievement_conditions(user_id, 'first_review_with_photo')
             
             publish_review_to_channel(user_id, review_data)
             
@@ -3211,7 +3707,7 @@ def handle_size_selection(call):
         
         if is_exclusive:
             buy_btn = types.InlineKeyboardButton(
-                text=f"💎 Купить за {product[4]} BS Coin",
+                text=f"💎 Купить за {get_product_field(product, 'coin_price', 0)} BS Coin",
                 callback_data=f"buy_coin_{product_id}_{size}"
             )
             markup.add(buy_btn)
@@ -3361,15 +3857,12 @@ def handle_topic_messages(message):
     
     check_comment_achievement(user_id)
 
-
 # ============ ЗАПУСК БОТА ============
 
 if __name__ == '__main__':
-    print("Бот запущен...")
+    log_info(logger, "Бот запущен...")
     try:
         bot.polling(none_stop=True)
     except Exception as e:
-        print(f"Ошибка при запуске бота: {e}")
-        print("Трассировка ошибки:")
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+        log_error(logger, e, "Ошибка при запуске бота")
         traceback.print_exc()

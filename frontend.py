@@ -1,5 +1,28 @@
 from telebot import types
 
+def get_product_field(product, field_name, default=None):
+    """Получить поле продукта по имени для совместимости с MySQL"""
+    if isinstance(product, dict):
+        return product.get(field_name, default)
+    elif isinstance(product, (list, tuple)):
+        # Маппинг полей для обратной совместимости
+        field_mapping = {
+            'product_id': 0,
+            'name': 1,
+            'description': 2,
+            'price': 3,
+            'price_yuan': 4,
+            'coin_price': 5,
+            'photo_id': 6,
+            'category': 7,
+            'topic': 8,
+            'is_available': 9,
+            'is_exclusive': 10
+        }
+        index = field_mapping.get(field_name, -1)
+        return product[index] if 0 <= index < len(product) else default
+    return default
+
 class Bot_inline_btns:
     def __init__(self):
         super(Bot_inline_btns, self).__init__()
@@ -25,7 +48,8 @@ class Bot_inline_btns:
         btn2 = types.KeyboardButton('🎁 Акции')
         btn3 = types.KeyboardButton('📢 Отзывы')
         btn4 = types.KeyboardButton('🛒 Заказать товар')
-        markup.add(btn1, btn2, btn3, btn4)
+        btn5 = types.KeyboardButton('🏆 Ачивки')
+        markup.add(btn1, btn2, btn3, btn4, btn5)
         return markup
 
     def profile_buttons(self, user_data):
@@ -52,14 +76,11 @@ class Bot_inline_btns:
     def product_buttons(self, products):
         markup = types.InlineKeyboardMarkup()
         for product in products:
-            if product[9]:
-                btn_text = f"{product[1]} - {product[4]} BS Coin"
-            else:
-                btn_text = f"{product[1]} - {product[3]}₽"
+            btn_text = f"{get_product_field(product, 'name', 'Неизвестно')} - {get_product_field(product, 'price', 0)}₽"
                 
             btn = types.InlineKeyboardButton(
                 text=btn_text,
-                callback_data=f"product_{product[0]}"
+                callback_data=f"product_{get_product_field(product, 'product_id', 0)}"
             )
             markup.add(btn)
             
@@ -104,37 +125,25 @@ class Bot_inline_btns:
         markup.add(btn1, btn2)
         return markup
     
-    def exclusive_products_buttons(self, products):
-        markup = types.InlineKeyboardMarkup()
-        for product in products:
-            btn = types.InlineKeyboardButton(
-                text=f"{product[1]} - {product[4]} BS Coin",
-                callback_data=f"product_{product[0]}"
-            )
-            markup.add(btn)
-        return markup
     
     def store_products_buttons(self, products):
         markup = types.InlineKeyboardMarkup()
         for product in products:
             btn = types.InlineKeyboardButton(
-                text=product[1],
-                callback_data=f"send_product_{product[0]}"
+                text=get_product_field(product, 'name', 'Неизвестно'),
+                callback_data=f"send_product_{get_product_field(product, 'product_id', 0)}"
             )
             markup.add(btn)
         return markup
 
-    def size_selection_buttons(self, variations, is_exclusive=False):
+    def size_selection_buttons(self, variations):
         markup = types.InlineKeyboardMarkup()
         for variation in variations:
             btn_text = f"📏 {variation['size']}"
             if variation['quantity'] > 0:
                 btn_text += f" ({variation['quantity']} шт.)"
                 
-            if is_exclusive:
-                callback_data = f"size_coin_{variation['product_id']}_{variation['size']}"
-            else:
-                callback_data = f"size_{variation['product_id']}_{variation['size']}"
+            callback_data = f"size_{variation['product_id']}_{variation['size']}"
                 
             btn = types.InlineKeyboardButton(
                 text=btn_text,
@@ -156,8 +165,8 @@ class Bot_inline_btns:
         markup = types.InlineKeyboardMarkup()
         for product in products:
             btn = types.InlineKeyboardButton(
-                text=product[1],
-                callback_data=f"post_product_{product[0]}"
+                text=get_product_field(product, 'name', 'Неизвестно'),
+                callback_data=f"post_product_{get_product_field(product, 'product_id', 0)}"
             )
             markup.add(btn)
         return markup
