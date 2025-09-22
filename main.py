@@ -60,6 +60,15 @@ except Exception as e:
 
 temp_data = {}
 pending_reviews = {}
+
+def clear_temp_data(user_id):
+    """Очистить временные данные пользователя"""
+    if user_id in temp_data:
+        # Если есть фото в процессе создания поста, очистим их
+        photos = temp_data[user_id].get('photos', [])
+        if photos:
+            cleanup_local_files(photos)
+        del temp_data[user_id]
 channels = [
     '@BridgeSide_Featback',
     '@BridgeSide_LifeStyle', 
@@ -259,7 +268,7 @@ def yadisk_list_images(product_id: str) -> list:
         "_embedded.limit": 1000,
     }
     r = requests.get("https://cloud-api.yandex.net/v1/disk/resources",
-                     headers=yadisk_headers(token), params=params, timeout=20)
+                     headers=yadisk_headers(token), params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
     items = (data.get("_embedded") or {}).get("items", [])
@@ -268,7 +277,7 @@ def yadisk_list_images(product_id: str) -> list:
 def yadisk_get_download_href(file_path: str) -> str:
     token = get_yadisk_tokens()
     r = requests.get("https://cloud-api.yandex.net/v1/disk/resources/download",
-                     headers=yadisk_headers(token), params={"path": file_path}, timeout=20)
+                     headers=yadisk_headers(token), params={"path": file_path}, timeout=30)
     r.raise_for_status()
     return r.json()["href"]
 
@@ -276,15 +285,32 @@ def download_photos_from_yadisk(product_id: str) -> list:
     dest_dir = os.path.join("/tmp", "bsbot", str(product_id))
     pathlib.Path(dest_dir).mkdir(parents=True, exist_ok=True)
     local_files: list[str] = []
-    for ypath in yadisk_list_images(product_id):
-        href = yadisk_get_download_href(ypath)
-        with requests.get(href, headers=yadisk_headers(get_yadisk_tokens()), stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            filename = os.path.basename(urllib.parse.urlparse(ypath).path)
-            local_path = os.path.join(dest_dir, filename)
-            with open(local_path, "wb") as f:
-                shutil.copyfileobj(resp.raw, f)
-            local_files.append(local_path)
+    
+    try:
+        image_paths = yadisk_list_images(product_id)
+        if not image_paths:
+            log_info(logger, f"Нет изображений для товара {product_id}")
+            return []
+            
+        for ypath in image_paths:
+            try:
+                href = yadisk_get_download_href(ypath)
+                with requests.get(href, headers=yadisk_headers(get_yadisk_tokens()), stream=True, timeout=30) as resp:
+                    resp.raise_for_status()
+                    filename = os.path.basename(urllib.parse.urlparse(ypath).path)
+                    local_path = os.path.join(dest_dir, filename)
+                    with open(local_path, "wb") as f:
+                        shutil.copyfileobj(resp.raw, f)
+                    local_files.append(local_path)
+                    log_info(logger, f"Скачано фото: {filename}")
+            except Exception as e:
+                log_error(logger, e, f"Ошибка скачивания фото {ypath}")
+                continue
+                
+    except Exception as e:
+        log_error(logger, e, f"Ошибка получения списка изображений для товара {product_id}")
+        return []
+        
     return local_files
 
 def cleanup_local_files(paths: list) -> None:
@@ -337,15 +363,70 @@ def show_product(user_id, product_id):
     
     buttons = Bot_inline_btns()
     
-    caption = (
-        f"🛍️ {get_product_field(product, 'name', 'Неизвестно')}\n\n"
-        f"📝 {get_product_field(product, 'description', '')}\n"
-        f"💰 Цена: {get_product_field(product, 'price', 0)}₽\n\n"
-        f"📏 Доступные размеры:"
-    )
+    # Получаем данные товара
+    product_name = get_product_field(product, 'name', 'Неизвестно')
+    description_full = get_product_field(product, 'description_full', '')
+    description_old = get_product_field(product, 'description', '')
+    table_id = get_product_field(product, 'table_id', '')
+    keywords = get_product_field(product, 'keywords', '')
+    price = get_product_field(product, 'price', 0)
     
+    # Формируем описание
+    caption_parts = []
+    
+    # Название товара
+    caption_parts.append(f"🛍️ *{product_name}*")
+    
+    # Описание товара (приоритет новому полю, если пустое - используем старое)
+    description_to_show = description_full if description_full else description_old
+    if description_to_show and description_to_show.strip():
+        # Убираем хештеги из описания, если они есть
+        description_clean = description_to_show
+        if '\n' in description_clean:
+            lines = description_clean.split('\n')
+            # Убираем строки с хештегами из описания
+            description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
+        
+        if description_clean:
+            # Форматируем как blockquote
+            quoted_description = '\n'.join([f"> {line}" for line in description_clean.split('\n')])
+            caption_parts.append(quoted_description)
+    
+    # Артикул товара
+    if table_id and table_id.strip():
+        caption_parts.append(f"🆔 Артикул: `{table_id}`")
+    
+    # Цена
+    if price > 0:
+        caption_parts.append(f"💰 Цена: {price}₽")
+    else:
+        caption_parts.append("💰 Цена: Уточняйте")
+    
+    # Доступные размеры
+    if available_sizes:
+        caption_parts.append("📏 Доступные размеры:")
     for variation in available_sizes:
-        caption += f"\n• {variation['size']} - {variation['quantity']} шт."
+            caption_parts.append(f"• {variation['size']} - {variation['quantity']} шт.")
+    
+    # Хештеги (извлекаем из описания или используем поле keywords)
+    hashtags_to_show = ""
+    
+    # Сначала пытаемся извлечь хештеги из описания
+    if description_to_show and '\n' in description_to_show:
+        lines = description_to_show.split('\n')
+        hashtag_lines = [line.strip() for line in lines if line.strip().startswith('#')]
+        if hashtag_lines:
+            hashtags_to_show = ' '.join(hashtag_lines)
+    
+    # Если хештеги не найдены в описании, используем поле keywords
+    if not hashtags_to_show and keywords and keywords.strip():
+        hashtags_to_show = keywords.strip()
+    
+    # Добавляем хештеги в конец
+    if hashtags_to_show:
+        caption_parts.append(f"\n{hashtags_to_show}")
+    
+    caption = "\n\n".join(caption_parts)
     
     if available_sizes:
         markup = buttons.size_selection_buttons(available_sizes)
@@ -359,7 +440,8 @@ def show_product(user_id, product_id):
                 user_id,
                 photo_id,
                 caption=caption,
-                reply_markup=markup
+                reply_markup=markup,
+                parse_mode="Markdown"
             )
             return
         except Exception as e:
@@ -368,7 +450,8 @@ def show_product(user_id, product_id):
     bot.send_message(
         user_id,
         caption,
-        reply_markup=markup
+        reply_markup=markup,
+        parse_mode="Markdown"
     )
 
 def check_and_fix_photos():
@@ -436,6 +519,63 @@ def process_products_file(message):
         with open(filename, 'wb') as f:
             f.write(downloaded_file)
         
+        # Проверяем, есть ли листы "ЭКОНОМИКА" и "КЛЮЧИ"
+        excel_file = pd.ExcelFile(filename)
+        sheet_names = excel_file.sheet_names
+        
+        if 'ЭКОНОМИКА' in sheet_names and 'КЛЮЧИ' in sheet_names:
+            # Новая структура с двумя листами
+            bot.send_message(user_id, "📊 Обнаружена новая структура файла с листами 'ЭКОНОМИКА' и 'КЛЮЧИ'")
+            
+            economics_df = pd.read_excel(filename, sheet_name='ЭКОНОМИКА')
+            keys_df = pd.read_excel(filename, sheet_name='КЛЮЧИ')
+            
+            # Проверяем необходимые колонки в листе "ЭКОНОМИКА"
+            required_economics_columns = ['Модель', 'ID модели', 'Размер', 'Цена Y', 'Кол.', 'Цена продажи', 'Цвет', 'Ссылки']
+            missing_economics_columns = [col for col in required_economics_columns if col not in economics_df.columns]
+            
+            if missing_economics_columns:
+                bot.send_message(user_id, f"❌ В листе 'ЭКОНОМИКА' отсутствуют колонки: {', '.join(missing_economics_columns)}")
+                os.remove(filename)
+                return
+            
+            # Проверяем необходимые колонки в листе "КЛЮЧИ"
+            required_keys_columns = ['ID', 'Краткое описание товара Telegram', '#Хештеги']
+            missing_keys_columns = [col for col in required_keys_columns if col not in keys_df.columns]
+            
+            if missing_keys_columns:
+                bot.send_message(user_id, f"❌ В листе 'КЛЮЧИ' отсутствуют колонки: {', '.join(missing_keys_columns)}")
+                os.remove(filename)
+                return
+            
+            success_count = db_actions.import_products_from_excel_new_format(economics_df, keys_df)
+            
+            total_products = len(economics_df['Модель'].unique())
+            total_variations = len(economics_df)
+            zero_quantity = len(economics_df[economics_df['Кол.'].fillna(0) == 0])
+            
+            stats_msg = (
+                f"✅ Успешно импортировано {success_count} товаров\n\n"
+                f"📊 Статистика:\n"
+                f"• Уникальных моделей: {total_products}\n"
+                f"• Всего вариаций: {total_variations}\n"
+                f"• С нулевым количеством: {zero_quantity}\n"
+                f"• Диапазон цен: {economics_df['Цена продажи'].min():.0f} - {economics_df['Цена продажи'].max():.0f}₽\n\n"
+                f"📊 Использована новая структура с описаниями и хештегами"
+            )
+            
+            bot.send_message(user_id, stats_msg)
+            
+            sample_msg = "📋 Пример первых 5 товаров:\n"
+            for i, (_, row) in enumerate(economics_df.head().iterrows()):
+                sample_msg += f"{i+1}. {row['Модель']} - {row['Размер']} - {row['Цена продажи']}₽\n"
+            
+            bot.send_message(user_id, sample_msg)
+            
+        else:
+            # Старая структура с одним листом
+            bot.send_message(user_id, "📊 Обнаружена старая структура файла")
+        
         df = pd.read_excel(filename)
         
         required_columns = ['Модель', 'ID Модели', 'Размер', 'Цена Y', 'Количество', 'Цена', 'Ссылка']
@@ -502,7 +642,8 @@ def process_products_file(message):
             f"• Уникальных моделей: {total_products}\n"
             f"• Всего вариаций: {total_variations}\n"
             f"• С нулевым количеством: {zero_quantity}\n"
-            f"• Диапазон цен: {df['Цена'].min():.0f} - {df['Цена'].max():.0f}₽"
+                f"• Диапазон цен: {df['Цена'].min():.0f} - {df['Цена'].max():.0f}₽\n\n"
+                f"📊 Использована старая структура"
         )
         
         bot.send_message(user_id, stats_msg)
@@ -515,12 +656,10 @@ def process_products_file(message):
         
     except Exception as e:
         error_msg = f"❌ Ошибка при обработке файла: {str(e)}"
-        print(f"Ошибка импорта: {e}")
-        import traceback
-        print(traceback.format_exc())
+        log_error(logger, e, "Ошибка импорта товаров")
         bot.send_message(user_id, error_msg)
     finally:
-        if os.path.exists(filename):
+        if 'filename' in locals() and os.path.exists(filename):
             os.remove(filename)
 
 def create_review_topic(user_data):
@@ -618,10 +757,10 @@ def send_review_for_moderation(user_id, review_data):
                     photo_params["message_thread_id"] = topic_id
                     
                 message = bot.send_photo(**photo_params)
-                pending_reviews[review_id]['message_id'] = message.message_id
-                
+            pending_reviews[review_id]['message_id'] = message.message_id
+            
                 # Остальные фото по отдельности
-                for photo in review_data['photos'][1:]:
+            for photo in review_data['photos'][1:]:
                     single_photo_params = {
                         "chat_id": admin_group_id,
                         "photo": photo
@@ -961,8 +1100,7 @@ def cancel_order(message):
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    if user_id in temp_data:
-        del temp_data[user_id]
+    clear_temp_data(user_id)
     buttons = Bot_inline_btns()
     
     is_new_user = not db_actions.user_exists(user_id)
@@ -1062,15 +1200,18 @@ def test_button(message):
 
 @bot.message_handler(func=lambda msg: msg.text == '👤 Мой профиль')
 def show_profile(message):
+    clear_temp_data(message.from_user.id)
     profile(message)
 
 @bot.message_handler(func=lambda msg: msg.text == '🎁 Акции')
 def show_promo(message):
+    clear_temp_data(message.from_user.id)
     bot.send_message(message.chat.id, "🔥 Горячие акции")
 
 @bot.message_handler(func=lambda msg: msg.text == '📢 Отзывы')
 def show_reviews(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     buttons = Bot_inline_btns()
     
     try:
@@ -1082,7 +1223,7 @@ def show_reviews(message):
         if not reviews or len(reviews) == 0:
             bot.send_message(user_id, "Пока нет отзывов. Будьте первым!", reply_markup=buttons.reviews_buttons())
             return
-            
+        
         reviews_msg = "🔥 Последние отзывы:\n\n"
         
         for i, review in enumerate(reviews[:3]):
@@ -1112,7 +1253,7 @@ def show_reviews(message):
             except Exception as e:
                 log_error(logger, e, f"Ошибка обработки отзыва {i}: {review}")
                 reviews_msg += f"⭐️ Текст отзыва\n— Пользователь\n\n"
-        
+    
         bot.send_message(
             user_id,
             reviews_msg,
@@ -1126,11 +1267,13 @@ def show_reviews(message):
 @bot.message_handler(func=lambda msg: msg.text == '🏆 Ачивки')
 def show_achievements_menu(message):
     """Показать ачивки через меню"""
+    clear_temp_data(message.from_user.id)
     show_achievements(message)
 
 @bot.message_handler(commands=['my_orders'])
 def my_orders(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     orders = db_actions.get_user_orders(user_id)
     
     if not orders:
@@ -1151,6 +1294,8 @@ def my_orders(message):
 
 @bot.message_handler(commands=['support'])
 def support(message):
+    user_id = message.from_user.id
+    clear_temp_data(user_id)
     bot.reply_to(message, "🛠️ Наша служба поддержки работает для вас!\n\n"
                           "Если у вас возникли вопросы или проблемы:\n"
                           "• Напишите нам: @support_username\n"
@@ -1160,6 +1305,7 @@ def support(message):
 @bot.message_handler(commands=['ref'])
 def ref_command(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     user_data = db_actions.get_user_data(user_id)
     if not user_data:
         bot.send_message(user_id, "Сначала зарегистрируйтесь с помощью /start")
@@ -1189,6 +1335,7 @@ def ref_command(message):
 @bot.message_handler(commands=['set_discount'])
 def set_discount(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1215,6 +1362,7 @@ def set_discount(message):
 @bot.message_handler(commands=['add_coins'])
 def add_coins(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1236,6 +1384,7 @@ def add_coins(message):
 @bot.message_handler(commands=['user_info'])
 def user_info(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1271,6 +1420,7 @@ def user_info(message):
 @bot.message_handler(commands=['profile'])
 def profile(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
         
     user_data = db_actions.get_user_data(user_id)
     if not user_data:
@@ -1322,6 +1472,7 @@ def profile(message):
 def show_achievements(message):
     """Показать все ачивки пользователя"""
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     
     user_data = db_actions.get_user_data(user_id)
     if not user_data:
@@ -1369,6 +1520,7 @@ def show_achievements(message):
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
         
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔ Эта команда только для администраторов")
@@ -1384,6 +1536,7 @@ def admin_panel(message):
 @bot.message_handler(commands=['admin_stats'])
 def admin_stats(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1406,6 +1559,7 @@ def admin_stats(message):
 @bot.message_handler(commands=['export_products'])
 def export_products(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1446,6 +1600,7 @@ def export_products(message):
 @bot.message_handler(commands=['upload_products'])
 def upload_products(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1457,6 +1612,7 @@ def upload_products(message):
 def yadisk_auth(message):
     """Инициировать авторизацию Яндекс.Диска"""
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1561,6 +1717,7 @@ def handle_yadisk_code(message):
 @bot.message_handler(commands=['create_post'])
 def create_post(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1587,39 +1744,127 @@ def handle_enter_product_id(message):
         return
     product_id = message.text.strip()
     # Скачиваем фото
+    photos = []
     try:
         photos = download_photos_from_yadisk(product_id)
         if not photos:
-            bot.send_message(user_id, "❌ Фото не найдены на Яндекс.Диске")
-            return
-        temp_data[user_id]['photos'] = photos
-        temp_data[user_id]['product_id'] = product_id
-        # Получим товар для описания
-        product = db_actions.get_product(int(product_id)) if product_id.isdigit() else None
-        name = get_product_name(product) if product else f"Товар {product_id}"
-        price, currency = (get_product_field(product, 'price', 0) if product else 0, '₽') if product else (0, '₽')
-        desc = get_product_field(product, 'description', '') if product else ''
-        caption = f"🛍️ {name}\n\n📝 {desc}\n💰 Цена: {price}{currency}"
-        # Превью: отправим медиа-группу (до 10 фото)
+            log_info(logger, f"Фото не найдены на Яндекс.Диске для товара {product_id}")
+    except Exception as e:
+        log_error(logger, e, f"Ошибка при скачивании фото с Яндекс.Диска для товара {product_id}")
+        photos = []
+    
+    temp_data[user_id]['photos'] = photos
+    temp_data[user_id]['table_id'] = product_id  # Сохраняем артикул
+    
+    # Получим товар для описания по table_id (артикулу)
+    product = db_actions.get_product_by_table_id(product_id)
+    if not product:
+        bot.send_message(user_id, f"❌ Товар с артикулом {product_id} не найден в базе данных")
+        return
+        
+    # Получаем данные товара
+    product_name = get_product_field(product, 'name', 'Неизвестно')
+    description_full = get_product_field(product, 'description_full', '')
+    description_old = get_product_field(product, 'description', '')
+    table_id = get_product_field(product, 'table_id', '')
+    keywords = get_product_field(product, 'keywords', '')
+    price = get_product_field(product, 'price', 0)
+    
+    # Получаем доступные размеры
+    actual_product_id = get_product_field(product, 'product_id', 0)
+    temp_data[user_id]['product_id'] = actual_product_id  # Сохраняем числовой ID для кнопок
+    variations = db_actions.get_product_variations(actual_product_id)
+    available_sizes = []
+    if variations:
+        for variation in variations:
+            size = get_product_field(variation, 'size', '')
+            quantity = get_product_field(variation, 'quantity', 0)
+            if quantity > 0 and size:
+                available_sizes.append(size)
+    
+    # Формируем карточку товара
+    caption_parts = []
+    
+    # Название товара (жирным)
+    caption_parts.append(f"*{product_name}*")
+    
+    # Описание товара (приоритет новому полю, если пустое - используем старое)
+    description_to_show = description_full if description_full else description_old
+    if description_to_show and description_to_show.strip():
+        # Убираем хештеги из описания, если они есть
+        description_clean = description_to_show
+        if '\n' in description_clean:
+            lines = description_clean.split('\n')
+            # Ищем строки с хештегами (начинающиеся с #)
+            hashtag_lines = [line for line in lines if line.strip().startswith('#')]
+            if hashtag_lines:
+                # Убираем строки с хештегами из описания
+                description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
+        
+        if description_clean:
+            # Форматируем как blockquote
+            quoted_description = '\n'.join([f"> {line}" for line in description_clean.split('\n')])
+            caption_parts.append(quoted_description)
+    
+    # Артикул товара
+    if table_id and table_id.strip():
+        caption_parts.append(f"🆔 Артикул: `{table_id}`")
+    
+    # Доступные размеры
+    if available_sizes:
+        sizes_text = ", ".join(available_sizes[:10])  # Ограничиваем количество размеров
+        if len(available_sizes) > 10:
+            sizes_text += f" и еще {len(available_sizes) - 10}"
+        caption_parts.append(f"📏 Размеры: {sizes_text}")
+    
+    # Цена
+    if price > 0:
+        caption_parts.append(f"💰 Цена: {price}₽")
+    else:
+        caption_parts.append("💰 Цена: Уточняйте")
+    
+    # Хештеги (извлекаем из описания или используем поле keywords)
+    hashtags_to_show = ""
+    
+    # Сначала пытаемся извлечь хештеги из описания
+    if description_to_show and '\n' in description_to_show:
+        lines = description_to_show.split('\n')
+        hashtag_lines = [line.strip() for line in lines if line.strip().startswith('#')]
+        if hashtag_lines:
+            hashtags_to_show = ' '.join(hashtag_lines)
+    
+    # Если хештеги не найдены в описании, используем поле keywords
+    if not hashtags_to_show and keywords and keywords.strip():
+        hashtags_to_show = keywords.strip()
+    
+    # Добавляем хештеги в конец
+    if hashtags_to_show:
+        caption_parts.append(f"\n{hashtags_to_show}")
+    
+    caption = "\n\n".join(caption_parts)
+    
+    # Превью: отправляем медиа-группу если есть фото, иначе текстовое сообщение
+    if photos:
         media = []
         for idx, p in enumerate(photos[:10]):
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption))
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption, parse_mode="Markdown"))
             else:
                 media.append(types.InputMediaPhoto(open(p, 'rb')))
         bot.send_media_group(user_id, media)
-        # Кнопки
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(text="🚀 Выложить", callback_data=f"post_publish_{product_id}"),
-            types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"post_edit_{product_id}")
-        )
-        markup.add(types.InlineKeyboardButton(text="❌ Отменить", callback_data=f"post_cancel_{product_id}"))
-        bot.send_message(user_id, "Предпросмотр поста. Что делаем?", reply_markup=markup)
-        temp_data[user_id]['step'] = 'preview'
-    except Exception as e:
-        log_error(logger, e, "Ошибка при скачивании фото с Я.Диска")
-        bot.send_message(user_id, "❌ Не удалось скачать фото с Яндекс.Диска")
+    else:
+        # Отправляем текстовое сообщение с предпросмотром
+        bot.send_message(user_id, caption, parse_mode="Markdown")
+    
+    # Кнопки
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(text="🚀 Выложить", callback_data=f"post_publish_{actual_product_id}"),
+        types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"post_edit_{actual_product_id}")
+    )
+    markup.add(types.InlineKeyboardButton(text="❌ Отменить", callback_data=f"post_cancel_{actual_product_id}"))
+    bot.send_message(user_id, "Предпросмотр поста. Что делаем?", reply_markup=markup)
+    temp_data[user_id]['step'] = 'preview'
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('post_cancel_'))
 def handle_post_cancel(call):
@@ -1641,12 +1886,41 @@ def handle_post_publish(call):
         if not files:
             bot.answer_callback_query(call.id, "Нет файлов для публикации")
             return
-        # Формируем подпись из сохранённых значений
+        # Формируем подпись из сохранённых значений в требуемом формате
         product = db_actions.get_product(int(product_id)) if product_id and str(product_id).isdigit() else None
         name = get_product_name(product) if product else f"Товар {product_id}"
-        price, currency = (get_product_field(product, 'price', 0) if product else 0, '₽') if product else (0, '₽')
-        desc = get_product_field(product, 'description', '') if product else ''
-        caption = f"🛍️ {name}\n\n📝 {desc}\n💰 Цена: {price}{currency}"
+        description_full = get_product_field(product, 'description_full', '') if product else ''
+        description_old = get_product_field(product, 'description', '') if product else ''
+        table_id = get_product_field(product, 'table_id', '') if product else ''
+        keywords = get_product_field(product, 'keywords', '') if product else ''
+        price = get_product_field(product, 'price', 0) if product else 0
+
+        # Описание без строк-хэштегов
+        description_to_show = description_full if description_full else description_old
+        description_clean = description_to_show
+        if description_clean and '\n' in description_clean:
+            _lines = description_clean.split('\n')
+            description_clean = '\n'.join([ln for ln in _lines if not ln.strip().startswith('#')]).strip()
+
+        # Хэштеги: из исходного описания или из keywords
+        hashtags_to_show = ''
+        if description_to_show and '\n' in description_to_show:
+            h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
+            if h_lines:
+                hashtags_to_show = ' '.join(h_lines)
+        if not hashtags_to_show and keywords:
+            hashtags_to_show = keywords.strip()
+
+        parts = []
+        parts.append(f"{name}")
+        if description_clean:
+            parts.append(f"{description_clean}")
+        if table_id:
+            parts.append(f"Артикул: {table_id}")
+        parts.append(f"Цена: {price}₽")
+        if hashtags_to_show:
+            parts.append(f"{hashtags_to_show}")
+        caption = "\n\n".join(parts)
         config_data_local = config.get_config()
         chat_id = config_data_local.get('store_channel_id', '@BridgeSide_Store')
         topic_id = (config_data_local.get('topics') or {}).get('магазин')
@@ -1688,7 +1962,7 @@ def handle_new_caption(message):
         media = []
         for idx, p in enumerate(files[:10]):
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=new_caption))
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=new_caption, parse_mode="Markdown"))
             else:
                 media.append(types.InputMediaPhoto(open(p, 'rb')))
         bot.send_media_group(user_id, media)
@@ -1706,6 +1980,7 @@ def handle_new_caption(message):
 @bot.message_handler(commands=['export_users'])
 def export_users(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1730,6 +2005,7 @@ def export_users(message):
 def order_status_command(message):
     """Изменение статуса заказа"""
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1792,10 +2068,73 @@ def order_status_command(message):
     except Exception as e:
         bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
 
+# ============ ОБРАБОТЧИКИ ТЕКСТОВЫХ КНОПОК АДМИНА ============
+
+@bot.message_handler(func=lambda msg: msg.text == '➕ Добавить товар')
+def admin_add_product_text(message):
+    """Обработчик кнопки 'Добавить товар'"""
+    clear_temp_data(message.from_user.id)
+    add_product(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '👤 Информация о пользователе')
+def admin_user_info_text(message):
+    """Обработчик кнопки 'Информация о пользователе'"""
+    clear_temp_data(message.from_user.id)
+    user_info(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '🎯 Установить скидку')
+def admin_set_discount_text(message):
+    """Обработчик кнопки 'Установить скидку'"""
+    clear_temp_data(message.from_user.id)
+    set_discount(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '💰 Добавить монеты')
+def admin_add_coins_text(message):
+    """Обработчик кнопки 'Добавить монеты'"""
+    clear_temp_data(message.from_user.id)
+    add_coins(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📤 Загрузить товары')
+def admin_upload_products_text(message):
+    """Обработчик кнопки 'Загрузить товары'"""
+    clear_temp_data(message.from_user.id)
+    upload_products(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📊 Статистика админа')
+def admin_stats_text(message):
+    """Обработчик кнопки 'Статистика админа'"""
+    clear_temp_data(message.from_user.id)
+    admin_stats(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📋 Экспорт пользователей')
+def admin_export_users_text(message):
+    """Обработчик кнопки 'Экспорт пользователей'"""
+    clear_temp_data(message.from_user.id)
+    export_users(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📝 Создать пост')
+def admin_create_post_text(message):
+    """Обработчик кнопки 'Создать пост'"""
+    clear_temp_data(message.from_user.id)
+    create_post(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📦 Экспорт товаров')
+def admin_export_products_text(message):
+    """Обработчик кнопки 'Экспорт товаров'"""
+    clear_temp_data(message.from_user.id)
+    export_products(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '📋 Статус заказов')
+def admin_order_status_text(message):
+    """Обработчик кнопки 'Статус заказов'"""
+    clear_temp_data(message.from_user.id)
+    order_status_command(message)
+
 @bot.message_handler(commands=['orders'])
 def list_orders(message):
     """Показывает список всех заказов"""
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "⛔️ Недостаточно прав")
         return
@@ -1880,6 +2219,7 @@ def order_info(message):
 @bot.message_handler(commands=['add_product'])
 def add_product(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
         
     if not db_actions.user_is_admin(user_id):
         bot.send_message(user_id, "Эта команда только для администраторов")
@@ -1888,9 +2228,82 @@ def add_product(message):
     bot.send_message(user_id, "Отправьте фото товара")
     bot.register_next_step_handler(message, process_product_photo)
 
+@bot.message_handler(commands=['cancel'])
+def cancel_command(message):
+    """Универсальная команда отмены текущего процесса"""
+    user_id = message.from_user.id
+    clear_temp_data(user_id)
+    bot.send_message(user_id, "❌ Текущий процесс отменен")
+
+@bot.message_handler(commands=['check_product'])
+def check_product_data(message):
+    """Проверить данные товара"""
+    user_id = message.from_user.id
+    clear_temp_data(user_id)
+    
+    if not db_actions.user_is_admin(user_id):
+        bot.send_message(user_id, "⛔️ Недостаточно прав")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        bot.send_message(user_id, "Использование: /check_product <product_id>")
+        return
+    
+    try:
+        product_id = int(args[1])
+        product = db_actions.get_product(product_id)
+        
+        if not product:
+            bot.send_message(user_id, "❌ Товар не найден")
+            return
+        
+        # Показываем все поля товара
+        info = f"🔍 Данные товара ID {product_id}:\n\n"
+        for key, value in product.items():
+            info += f"• {key}: {value}\n"
+        
+        bot.send_message(user_id, info)
+        
+    except ValueError:
+        bot.send_message(user_id, "❌ ID товара должен быть числом")
+
+@bot.message_handler(commands=['check_product_by_table_id'])
+def check_product_by_table_id(message):
+    """Проверить данные товара по table_id (артикулу)"""
+    user_id = message.from_user.id
+    clear_temp_data(user_id)
+
+    if not db_actions.user_is_admin(user_id):
+        bot.send_message(user_id, "⛔️ Недостаточно прав")
+        return
+
+    args = message.text.split()
+    if len(args) != 2:
+        bot.send_message(user_id, "Использование: /check_product_by_table_id <table_id>")
+        return
+
+    try:
+        table_id = args[1]
+        product = db_actions.get_product_by_table_id(table_id)
+
+        if not product:
+            bot.send_message(user_id, f"❌ Товар с артикулом {table_id} не найден")
+            return
+
+        info = f"🔍 Данные товара с артикулом {table_id}:\n\n"
+        for key, value in product.items():
+            info += f"• {key}: {repr(value)}\n"
+
+        bot.send_message(user_id, info)
+
+    except Exception as e:
+        bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
+
 @bot.message_handler(commands=['test_order'])
 def test_order(message):
     user_id = message.from_user.id
+    clear_temp_data(user_id)
     try:
         # Симулируем процесс заказа
         temp_data[user_id] = {
@@ -1953,7 +2366,7 @@ def process_product_description(message, photo_id, name):
 def process_product_price(message, photo_id, name, desc):
     try:
         price = float(message.text)
-        
+    
         user_id = message.from_user.id
         temp_data[user_id] = {
             'name': name,
@@ -2131,24 +2544,42 @@ def publish_product_to_channel(product):
         chat_id = config_data['chat_id']
         topic_id = config_data['topics']['магазин']
         
-        deep_link = f"https://t.me/{bot.get_me().username}?start=product_{product['product_id']}"
+        # Формируем карточку товара в требуемом формате
+        name = product.get('name', 'Неизвестно')
+        description = product.get('description', '') or ''
+        # Убираем строки-хэштеги из описания
+        if '\n' in description:
+            _lines = description.split('\n')
+            description = '\n'.join([ln for ln in _lines if not ln.strip().startswith('#')]).strip()
+        table_id = product.get('table_id') or product.get('article') or ''
+        price = product.get('price', 0)
+        # Хэштеги: из описания или из поля keywords
+        hashtags = ''
+        if 'keywords' in product and product.get('keywords'):
+            hashtags = product.get('keywords', '').strip()
+        else:
+            # Попробуем достать строки-хэштеги из исходного описания
+            orig_desc = product.get('description', '') or ''
+            if '\n' in orig_desc:
+                h_lines = [ln.strip() for ln in orig_desc.split('\n') if ln.strip().startswith('#')]
+                if h_lines:
+                    hashtags = ' '.join(h_lines)
         
-        markup = types.InlineKeyboardMarkup()
-        buy_btn = types.InlineKeyboardButton(text="🛒 Купить", url=deep_link)
-        markup.add(buy_btn)
-        
-        caption = (
-            f"🛍️ {product['name']}\n\n"
-            f"📝 {product['description']}\n"
-            f"💰 Цена: {product['price']}₽\n\n"
-            f"👉 Нажмите «🛒 Купить» для заказа через бота"
-        )
+        caption_parts = []
+        caption_parts.append(f"{name}")
+        if description:
+            caption_parts.append(f"{description}")
+        if table_id:
+            caption_parts.append(f"Артикул: {table_id}")
+        caption_parts.append(f"Цена: {price}₽")
+        if hashtags:
+            caption_parts.append(f"{hashtags}")
+        caption = "\n\n".join(caption_parts)
         
         message = bot.send_photo(
             chat_id=chat_id,
             photo=product['photo_id'],
             caption=caption,
-            reply_markup=markup,
             message_thread_id=topic_id
         )
         
@@ -2228,8 +2659,9 @@ def handle_exclusive_post(call):
                 return
                 
             # Публикуем пост
+            table_id = temp_data[user_id].get('table_id', '')
             post_success = publish_post_to_channel(
-                product_id,
+                table_id,
                 temp_data[user_id].get('photos', []),
                 temp_data[user_id].get('text', ''),
                 False,
@@ -2309,8 +2741,9 @@ def process_coin_price_post(message):
             return
         
         # Публикуем пост
+        table_id = temp_data[user_id].get('table_id', '')
         post_success = publish_post_to_channel(
-            product_id,
+            table_id,
             temp_data[user_id].get('photos', []),
             temp_data[user_id].get('text', ''),
             True,
@@ -2339,11 +2772,12 @@ def process_coin_price_post(message):
         if user_id in temp_data:
             del temp_data[user_id]
 
-def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0):
+def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
     try:
-        product = db_actions.get_product(product_id)
+        # Получаем товар по table_id (артикулу)
+        product = db_actions.get_product_by_table_id(table_id)
         if not product:
-            log_error(logger, "Товар не найден")
+            log_error(logger, f"Товар с артикулом {table_id} не найден")
             return False
             
         config_data = config.get_config()
@@ -2353,18 +2787,75 @@ def publish_post_to_channel(product_id, photos, text, is_exclusive, coin_price=0
             log_error(logger, "Не указан channel_id в конфиге")
             return False
         
-        deep_link = f"https://t.me/{bot.get_me().username}?start=product_{product_id}"
+        actual_product_id = get_product_field(product, 'product_id', 0)
+        deep_link = f"https://t.me/{bot.get_me().username}?start=product_{actual_product_id}"
         
+        # Получаем данные товара
+        product_name = get_product_field(product, 'name', 'Неизвестно')
+        description_full = get_product_field(product, 'description_full', '')
+        product_table_id = get_product_field(product, 'table_id', '')
+        keywords = get_product_field(product, 'keywords', '')
+        
+        # Отладочная информация
+        log_info(logger, f"DEBUG: product_name: {repr(product_name)}")
+        log_info(logger, f"DEBUG: description_full: {repr(description_full)}")
+        log_info(logger, f"DEBUG: product_table_id: {repr(product_table_id)}")
+        log_info(logger, f"DEBUG: keywords: {repr(keywords)}")
+        
+        # Получаем доступные размеры
+        variations = db_actions.get_product_variations(actual_product_id)
+        available_sizes = []
+        if variations:
+            for variation in variations:
+                size = get_product_field(variation, 'size', '')
+                quantity = get_product_field(variation, 'quantity', 0)
+                if quantity > 0 and size:
+                    available_sizes.append(size)
+        
+        # Формируем цену
         if not is_exclusive:
             price_text = f"💰 Цена: {get_product_field(product, 'price', 0)}₽"
         else:
             price_text = f"💎 Цена: {coin_price} BS Coin"
         
-        caption = (
-            f"{text}\n\n"
-            f"{price_text}\n\n"
-            f"👉 [Купить]({deep_link})"
-        )
+        # Формируем карточку товара строго в формате:
+        # Название, Описание, Артикул, Цена, Хэштеги
+        caption_parts = []
+        caption_parts.append(f"{product_name}")
+        
+        description_old = get_product_field(product, 'description', '')
+        description_to_show = description_full if description_full else description_old
+        if description_to_show:
+            description_clean = description_to_show
+            if '\n' in description_clean:
+                lines = description_clean.split('\n')
+                description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
+            if description_clean:
+                caption_parts.append(description_clean)
+        
+        if product_table_id:
+            caption_parts.append(f"Артикул: {product_table_id}")
+        
+        caption_parts.append(f"{price_text.replace('💰 ', '').replace('💎 ', '')}")
+        
+        hashtags_to_show = ""
+        if description_to_show and '\n' in description_to_show:
+            lines = description_to_show.split('\n')
+            hashtag_lines = [line.strip() for line in lines if line.strip().startswith('#')]
+            if hashtag_lines:
+                hashtags_to_show = ' '.join(hashtag_lines)
+        if not hashtags_to_show and keywords:
+            hashtags_to_show = keywords.strip()
+        if hashtags_to_show:
+            caption_parts.append(f"{hashtags_to_show}")
+        
+        caption = "\n\n".join(caption_parts)
+        
+        # Отладочная информация
+        log_info(logger, f"DEBUG: Отправляем в канал caption: {repr(caption)}")
+        log_info(logger, f"DEBUG: Количество частей caption: {len(caption_parts)}")
+        for i, part in enumerate(caption_parts):
+            log_info(logger, f"DEBUG: Часть {i}: {repr(part)}")
         
         # Отправляем медиагруппу с фотографиями
         if photos and len(photos) > 0:

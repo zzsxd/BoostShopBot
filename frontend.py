@@ -29,16 +29,16 @@ class Bot_inline_btns:
 
     def admin_buttons(self):
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        btn1 = types.KeyboardButton('/add_product')
-        btn2 = types.KeyboardButton('/user_info')
-        btn3 = types.KeyboardButton('/set_discount')
-        btn4 = types.KeyboardButton('/add_coins')
-        btn5 = types.KeyboardButton('/upload_products')
-        btn6 = types.KeyboardButton("/admin_stats")
-        btn7 = types.KeyboardButton('/export_users')
-        btn8 = types.KeyboardButton('/create_post')
-        btn9 = types.KeyboardButton('/export_products')
-        btn10 = types.KeyboardButton('/order_status')
+        btn1 = types.KeyboardButton('➕ Добавить товар')
+        btn2 = types.KeyboardButton('👤 Информация о пользователе')
+        btn3 = types.KeyboardButton('🎯 Установить скидку')
+        btn4 = types.KeyboardButton('💰 Добавить монеты')
+        btn5 = types.KeyboardButton('📤 Загрузить товары')
+        btn6 = types.KeyboardButton('📊 Статистика админа')
+        btn7 = types.KeyboardButton('📋 Экспорт пользователей')
+        btn8 = types.KeyboardButton('📝 Создать пост')
+        btn9 = types.KeyboardButton('📦 Экспорт товаров')
+        btn10 = types.KeyboardButton('📋 Статус заказов')
         markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8, btn9, btn10)
         return markup
 

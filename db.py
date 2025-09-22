@@ -23,6 +23,9 @@ class DB:
 
     def init(self):
         try:
+            # Убеждаемся, что база данных существует
+            self.__ensure_database()
+
             self.__db = pymysql.connect(
                 host=self.__host,
                 user=self.__user,
@@ -43,6 +46,32 @@ class DB:
             
         except pymysql.Error as e:
             log_error(logger, e, "Ошибка подключения к MySQL")
+            raise
+
+    def __ensure_database(self):
+        """Создает базу данных, если она отсутствует, с нужной кодировкой."""
+        try:
+            tmp_conn = pymysql.connect(
+                host=self.__host,
+                user=self.__user,
+                password=self.__password,
+                port=self.__port,
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=5,
+                read_timeout=5,
+                write_timeout=5
+            )
+            try:
+                with tmp_conn.cursor() as cur:
+                    cur.execute(
+                        f"CREATE DATABASE IF NOT EXISTS `{self.__database}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    )
+                tmp_conn.commit()
+            finally:
+                tmp_conn.close()
+        except pymysql.Error as e:
+            log_error(logger, e, "Ошибка создания базы данных")
             raise
 
     def create_tables(self):
@@ -74,6 +103,9 @@ class DB:
                     product_id INT AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(255),
                     description TEXT,
+                    description_full TEXT,
+                    table_id VARCHAR(100),
+                    keywords TEXT,
                     price DECIMAL(10, 2),
                     price_yuan DECIMAL(10, 2),
                     coin_price INT DEFAULT 0,
@@ -208,6 +240,7 @@ class DB:
     def migrate_tables(self):
         self.migrate_orders_detailed_table()
         self.migrate_users_table()
+        self.migrate_products_table()
 
     def migrate_orders_detailed_table(self):
         try:
@@ -259,6 +292,36 @@ class DB:
                 
         except pymysql.Error as e:
             log_error(logger, e, "❌ Ошибка миграции users")
+
+    def migrate_products_table(self):
+        try:
+            # Проверяем существование колонок
+            self.__cursor.execute("""
+                SELECT COLUMN_NAME 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = 'products' 
+                AND TABLE_SCHEMA = DATABASE()
+            """)
+            columns = [row['COLUMN_NAME'] for row in self.__cursor.fetchall()]
+            
+            # Добавляем новые колонки, если их нет
+            if 'description_full' not in columns:
+                self.__cursor.execute("ALTER TABLE products ADD COLUMN description_full TEXT NULL")
+                self.__db.commit()
+                log_info(logger, "✅ Добавлена колонка description_full в products")
+            
+            if 'table_id' not in columns:
+                self.__cursor.execute("ALTER TABLE products ADD COLUMN table_id VARCHAR(100) NULL")
+                self.__db.commit()
+                log_info(logger, "✅ Добавлена колонка table_id в products")
+            
+            if 'keywords' not in columns:
+                self.__cursor.execute("ALTER TABLE products ADD COLUMN keywords TEXT NULL")
+                self.__db.commit()
+                log_info(logger, "✅ Добавлена колонка keywords в products")
+                
+        except pymysql.Error as e:
+            log_error(logger, e, "❌ Ошибка миграции products")
 
     def db_write(self, query, params=None):
         try:

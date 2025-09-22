@@ -13,10 +13,53 @@ class DbAct:
         self.__config = config
         self.__path_xlsx = path_xlsx
 
+    def __normalize_username(self, username):
+        if not username:
+            return None
+        uname = str(username).strip()
+        if uname.startswith('@'):
+            uname = uname[1:]
+        return uname.lower()
+
+    def __is_admin_in_config(self, user_id=None, username=None):
+        """Check admin status against config by user_id or username."""
+        cfg = self.__config.get_config() or {}
+        admins_list = cfg.get('admins', []) or []
+        admin_usernames = cfg.get('admin_usernames', []) or []
+
+        # Normalize IDs list: allow strings or ints
+        admin_ids_normalized = set()
+        for val in admins_list:
+            try:
+                admin_ids_normalized.add(int(val))
+            except Exception:
+                # If it's not an int, treat it as a username token
+                uname_norm = self.__normalize_username(val)
+                if uname_norm:
+                    admin_usernames.append(uname_norm)
+
+        # Normalize usernames list
+        admin_usernames_normalized = set(self.__normalize_username(u) for u in admin_usernames if self.__normalize_username(u))
+
+        # Check by id
+        if user_id is not None:
+            try:
+                if int(user_id) in admin_ids_normalized:
+                    return True
+            except Exception:
+                pass
+
+        # Check by username
+        uname_norm = self.__normalize_username(username)
+        if uname_norm and uname_norm in admin_usernames_normalized:
+            return True
+
+        return False
+
     def add_user(self, user_id, first_name, last_name, username):
         if not self.user_exists(user_id):
             referral_code = f"ref_{user_id}"
-            is_admin = user_id in self.__config.get_config()['admins']
+            is_admin = self.__is_admin_in_config(user_id=user_id, username=username)
             self.__db.db_write(
                 '''INSERT INTO users 
                 (user_id, first_name, last_name, username, referral_code, is_admin, last_active) 
@@ -29,8 +72,16 @@ class DbAct:
         return data[0]['COUNT(*)'] > 0 if data else False
 
     def user_is_admin(self, user_id):
-        data = self.__db.db_read('SELECT is_admin FROM users WHERE user_id = %s', (user_id,))
-        return data[0]['is_admin'] if data else False
+        """Check if user is admin by DB flag or by config (user_id or username)."""
+        data = self.__db.db_read('SELECT is_admin, username FROM users WHERE user_id = %s', (user_id,))
+        if data:
+            row = data[0]
+            if bool(row.get('is_admin')):
+                return True
+            # Fallback to config-based check via username
+            return self.__is_admin_in_config(user_id=user_id, username=row.get('username'))
+        # If user not in DB, still allow config-based admin by id/username
+        return self.__is_admin_in_config(user_id=user_id, username=None)
 
     def get_user_data(self, user_id):
         data = self.__db.db_read('SELECT * FROM users WHERE user_id = %s', (user_id,))
@@ -85,12 +136,12 @@ class DbAct:
             (discount, user_id)
         )
 
-    def add_product(self, name, description, price, price_yuan, photo_id, category):
+    def add_product(self, name, description, price, price_yuan, photo_id, category, description_full=None, table_id=None, keywords=None):
         try:
             result = self.__db.db_write(
-                '''INSERT INTO products (name, description, price, price_yuan, photo_id, category, topic) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-                (name, description, price, price_yuan, photo_id, category, "магазин")
+                '''INSERT INTO products (name, description, description_full, table_id, keywords, price, price_yuan, photo_id, category, topic) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                (name, description, description_full, table_id, keywords, price, price_yuan, photo_id, category, "магазин")
             )
             
             if result:
@@ -111,6 +162,12 @@ class DbAct:
     def get_product(self, product_id):
         log_info(logger, "DEBUG get_product: product_id = {product_id}")
         data = self.__db.db_read('SELECT * FROM products WHERE product_id = %s', (product_id,))
+        return data[0] if data else None
+
+    def get_product_by_table_id(self, table_id):
+        """Получить товар по table_id (артикулу)"""
+        log_info(logger, f"DEBUG get_product_by_table_id: table_id = {table_id}")
+        data = self.__db.db_read('SELECT * FROM products WHERE table_id = %s', (table_id,))
         return data[0] if data else None
 
     def create_order(self, user_id, product_id, quantity):
@@ -332,6 +389,114 @@ class DbAct:
                 continue
                 
         log_info(logger, "Импорт завершен. Успешно: {success_count}")
+        return success_count
+
+    def import_products_from_excel_new_format(self, economics_df, keys_df):
+        """Импорт товаров из новой структуры Excel с двумя листами"""
+        success_count = 0
+        
+        self.clear_all_products()
+        
+        # Создаем словарь для быстрого поиска описаний по ID модели
+        keys_dict = {}
+        for _, row in keys_df.iterrows():
+            model_id = str(row.get('ID', '')).strip()
+            if model_id:
+                keys_dict[model_id] = {
+                    'description': str(row.get('Краткое описание товара Telegram', '')).strip(),
+                    'hashtags': str(row.get('#Хештеги', '')).strip(),
+                    'keywords': str(row.get('Топ - 10 ключевый запросов Yandex WordStat', '')).strip()
+                }
+        
+        # Группируем товары по модели
+        grouped = economics_df.groupby('Модель')
+        
+        for model_name, group in grouped:
+            try:
+                if pd.isna(model_name) or str(model_name).strip() == '':
+                    log_info(logger, f"Пропущена пустая модель: {model_name}")
+                    continue
+                    
+                first_row = group.iloc[0]
+                model_id = str(first_row.get('ID модели', '')).strip()
+                
+                # Получаем описание из листа "КЛЮЧИ"
+                product_info = keys_dict.get(model_id, {})
+                description = product_info.get('description', f"Модель: {model_name}")
+                hashtags = product_info.get('hashtags', '')
+                keywords = product_info.get('keywords', '')
+                
+                # Формируем полное описание
+                full_description = description
+                if hashtags:
+                    full_description += f"\n\n{hashtags}"
+                
+                # Используем цену продажи как основную цену
+                price = self.safe_convert(first_row.get('Цена продажи'), float, 0)
+                price_yuan = self.safe_convert(first_row.get('Цена Y'), float, 0)
+                
+                log_info(logger, f"Добавляем товар: {model_name}, цена: {price}, цена Y: {price_yuan}")
+                
+                product_id = self.add_product(
+                    name=str(model_name),
+                    description=f"Модель: {model_name}",
+                    description_full=full_description,
+                    table_id=model_id,
+                    keywords=keywords,
+                    price=price,
+                    price_yuan=price_yuan,
+                    photo_id=None,
+                    category="general"
+                )
+                
+                if product_id:
+                    log_info(logger, f"Товар добавлен, ID: {product_id}")
+                    variation_count = 0
+                    
+                    for _, row in group.iterrows():
+                        try:
+                            quantity = int(self.safe_convert(row.get('Кол.'), int, 0))
+                            size = str(row.get('Размер', '')).strip()
+                            color = str(row.get('Цвет', '')).strip()
+                            
+                            if not size or pd.isna(size):
+                                continue
+                            
+                            # Используем цену продажи для вариации
+                            variation_price = self.safe_convert(row.get('Цена продажи'), float, price)
+                            variation_price_yuan = self.safe_convert(row.get('Цена Y'), float, price_yuan)
+                            
+                            # Формируем ссылку
+                            link = str(row.get('Ссылки', '')).strip()
+                            
+                            # Добавляем информацию о цвете в размер
+                            size_with_color = f"{size}"
+                            if color and color != 'nan':
+                                size_with_color += f" ({color})"
+                            
+                            self.add_product_variation(
+                                product_id=product_id,
+                                model_id=model_id,
+                                size=size_with_color,
+                                quantity=quantity,
+                                price=variation_price,
+                                price_yuan=variation_price_yuan,
+                                link=link if link else None
+                            )
+                            variation_count += 1
+                            
+                        except Exception as e:
+                            log_error(logger, e, f"Ошибка добавления вариации для {model_name}")
+                            continue
+                    
+                    log_info(logger, f"Добавлено {variation_count} вариаций для {model_name}")
+                    success_count += 1
+                    
+            except Exception as e:
+                log_error(logger, e, f"Ошибка добавления товара {model_name}")
+                continue
+        
+        log_info(logger, f"Импорт завершен. Успешно: {success_count}")
         return success_count
 
     def add_product_variation(self, product_id, model_id, size, quantity, price, price_yuan, link):
