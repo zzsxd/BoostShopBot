@@ -37,12 +37,26 @@ try:
     config = ConfigParser(f'{work_dir}/{config_name}', os_type)
     config_data = config.get_config()
     mysql_config = config_data.get('mysql', {})
+    host_raw = mysql_config.get('host', '127.0.0.1')
+    port_raw = mysql_config.get('port', 3306)
+
+    # Если в host передан URL (например, http://localhost:8000/index.php?route=/), распарсим
+    parsed_host = urllib.parse.urlparse(host_raw) if isinstance(host_raw, str) and host_raw.startswith('http') else None
+    if parsed_host:
+        host = parsed_host.hostname or '127.0.0.1'
+        # Порт MySQL оставляем стандартный, т.к. 8000 — это, скорее всего, порт веб-интерфейса
+        port = 3306
+    else:
+        host = host_raw
+        # Если по ошибке указан 8000, заменим на 3306
+        port = 3306 if str(port_raw) == '8000' else port_raw
+
     db = DB(
-        host=mysql_config.get('host', '127.0.0.1'),
+        host=host,
         user=mysql_config.get('user', 'root'),
         password=mysql_config.get('password', '12345678'),
         database=mysql_config.get('database', 'bridgeside_bot'),
-        port=mysql_config.get('port', 3306),
+        port=port,
         lock=Lock()
     )
     db_actions = DbAct(db, config, config_data['xlsx_path'])
@@ -577,7 +591,37 @@ def process_products_file(message):
             bot.send_message(user_id, "📊 Обнаружена старая структура файла")
         
         df = pd.read_excel(filename)
-        
+
+        # Нормализуем названия колонок для старого формата (частые варианты из файлов)
+        def _normalize_column_name(name):
+            return str(name).strip().lower()
+
+        column_synonyms = {
+            'id модели': 'ID Модели',
+            'id модели.': 'ID Модели',
+            'кол.': 'Количество',
+            'количество': 'Количество',
+            'ссылки': 'Ссылка',
+            'ссылка': 'Ссылка',
+            'цена продажи': 'Цена',
+            'цена': 'Цена',
+            'цена y': 'Цена Y',
+            'модель': 'Модель',
+            'размер': 'Размер',
+        }
+
+        normalized_columns = {}
+        for original_col in list(df.columns):
+            key = _normalize_column_name(original_col)
+            if key in column_synonyms:
+                target = column_synonyms[key]
+                if original_col != target and target not in df.columns:
+                    df.rename(columns={original_col: target}, inplace=True)
+                normalized_columns[target] = True
+            else:
+                # оставляем исходное имя, если нет синонима
+                normalized_columns[original_col] = True
+
         required_columns = ['Модель', 'ID Модели', 'Размер', 'Цена Y', 'Количество', 'Цена', 'Ссылка']
         missing_columns = [col for col in required_columns if col not in df.columns]
         
@@ -793,8 +837,7 @@ def publish_review_to_channel(user_id, review_data):
         caption = (
             f"⭐️ Новый отзыв\n\n"
             f"👤 От: {user_data['first_name']} {user_data['last_name']}\n\n"
-            f"📝 {review_data['text']}\n\n"
-            f"💬 Присоединяйтесь к обсуждению!"
+            f"📝 {review_data['text']}"
         )
         
         if review_data.get('photos'):
@@ -1296,11 +1339,140 @@ def my_orders(message):
 def support(message):
     user_id = message.from_user.id
     clear_temp_data(user_id)
-    bot.reply_to(message, "🛠️ Наша служба поддержки работает для вас!\n\n"
-                          "Если у вас возникли вопросы или проблемы:\n"
-                          "• Напишите нам: @support_username\n"
-                          "• Время работы: 10:00-22:00 (МСК)\n\n"
-                          "Мы ответим вам в течение 15 минут!")
+    temp_data[user_id] = temp_data.get(user_id, {})
+    temp_data[user_id]['support_step'] = 'awaiting_description'
+    bot.reply_to(message, "🛟 Опишите вашу проблему одним сообщением, и мы свяжемся с вами.")
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('support_step') == 'awaiting_description')
+def handle_support_description(message):
+    user_id = message.from_user.id
+    text = message.text or ''
+    temp_data[user_id]['support_step'] = 'submitted'
+    temp_data[user_id]['support_text'] = text
+    user_data = db_actions.get_user_data(user_id) or {}
+    first_name = user_data.get('first_name') or message.from_user.first_name or ''
+    last_name = user_data.get('last_name') or message.from_user.last_name or ''
+    username = user_data.get('username') or (message.from_user.username or '')
+
+    # Создаем топик в админ-группе
+    try:
+        cfg = config.get_config() or {}
+        admin_group_id = cfg.get('admin_group_id')
+        topic_name = f"{first_name} {last_name} ПОДДЕРЖКА".strip()
+        topic = bot.create_forum_topic(chat_id=admin_group_id, name=topic_name)
+        topic_id = topic.message_thread_id if topic else None
+    except Exception as e:
+        topic_id = None
+
+    # Кнопки для админа
+    markup = types.InlineKeyboardMarkup()
+    approve_btn = types.InlineKeyboardButton("✅ Принять", callback_data=f"support_accept_{user_id}")
+    reject_btn = types.InlineKeyboardButton("❌ Отклонить", callback_data=f"support_reject_{user_id}")
+    markup.add(approve_btn, reject_btn)
+
+    admin_text = (
+        f"🆘 Запрос в поддержку\n\n"
+        f"👤 Пользователь: {first_name} {last_name}\n"
+        f"🔗 @{username}\n\n"
+        f"📄 Описание: {text}"
+    )
+    send_kwargs = {"chat_id": admin_group_id, "text": admin_text, "reply_markup": markup}
+    if topic_id:
+        send_kwargs["message_thread_id"] = topic_id
+    msg = bot.send_message(**send_kwargs)
+
+    # Сохраняем связь
+    temp_data[user_id]['support_topic_id'] = topic_id
+    temp_data[user_id]['support_chat_id'] = admin_group_id
+    temp_data[user_id]['support_message_id'] = msg.message_id
+    temp_data[user_id]['support_status'] = 'awaiting'
+
+    bot.send_message(user_id, "✅ Запрос отправлен. Ожидайте ответа оператора.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('support_accept_') or call.data.startswith('support_reject_'))
+def handle_support_decision(call):
+    admin_id = call.from_user.id
+    if not db_actions.user_is_admin(admin_id):
+        bot.answer_callback_query(call.id, "⛔ Только для администраторов")
+        return
+    parts = call.data.split('_')
+    action = parts[1]
+    user_id = int(parts[2])
+    data = temp_data.get(user_id, {})
+    topic_id = data.get('support_topic_id')
+    chat_id = data.get('support_chat_id')
+
+    if action == 'reject':
+        temp_data[user_id]['support_status'] = 'rejected'
+        bot.answer_callback_query(call.id, "Отклонено")
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=data.get('support_message_id'), reply_markup=None)
+        bot.send_message(user_id, "❌ В поддержке отказано. Попробуйте сформулировать запрос по-другому или позже.")
+        return
+
+    if action == 'accept':
+        temp_data[user_id]['support_status'] = 'active'
+        bot.answer_callback_query(call.id, "Принято")
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=data.get('support_message_id'), reply_markup=None)
+        bot.send_message(user_id, "✅ Оператор подключился. Напишите ваше сообщение — мы ответим.")
+        # Пометим связку для релея сообщений
+        temp_data[user_id]['relay'] = {
+            'chat_id': chat_id,
+            'topic_id': topic_id
+        }
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('support_status') == 'active')
+def relay_user_to_admin(message):
+    user_id = message.from_user.id
+    relay = temp_data.get(user_id, {}).get('relay') or {}
+    chat_id = relay.get('chat_id')
+    topic_id = relay.get('topic_id')
+    try:
+        kwargs = {"chat_id": chat_id, "text": f"✉️ От пользователя: {message.text}"}
+        if topic_id:
+            kwargs["message_thread_id"] = topic_id
+        bot.send_message(**kwargs)
+    except Exception as _:
+        pass
+
+@bot.message_handler(func=lambda m: m.chat.type in ['supergroup', 'group'] and hasattr(m, 'is_topic_message') and m.is_topic_message and str(m.text or '').startswith('/close_support'))
+def close_support_from_topic(message):
+    admin_id = message.from_user.id
+    if not db_actions.user_is_admin(admin_id):
+        return
+    # Находим пользователя по topic_id
+    topic_id = message.message_thread_id
+    user_id = None
+    for uid, data in temp_data.items():
+        if isinstance(data, dict) and data.get('relay', {}).get('topic_id') == topic_id:
+            user_id = uid
+            break
+    if not user_id:
+        return
+    temp_data[user_id]['support_status'] = 'closed'
+    bot.send_message(user_id, "✅ Диалог с поддержкой завершен.")
+    # Опционально — закрыть сам топик
+    try:
+        cfg = config.get_config() or {}
+        admin_group_id = cfg.get('admin_group_id')
+        bot.close_forum_topic(chat_id=admin_group_id, message_thread_id=topic_id)
+    except Exception:
+        pass
+
+@bot.message_handler(func=lambda m: m.chat.type in ['supergroup', 'group'] and hasattr(m, 'is_topic_message') and m.is_topic_message)
+def relay_admin_to_user(message):
+    # Релеим сообщения из топика админгруппы пользователю, если сессия активна
+    topic_id = message.message_thread_id
+    user_id = None
+    for uid, data in temp_data.items():
+        if isinstance(data, dict) and data.get('relay', {}).get('topic_id') == topic_id and data.get('support_status') == 'active':
+            user_id = uid
+            break
+    if not user_id:
+        return
+    try:
+        bot.send_message(user_id, f"👨‍💼 Оператор: {message.text}")
+    except Exception:
+        pass
 
 @bot.message_handler(commands=['ref'])
 def ref_command(message):
@@ -1773,88 +1945,132 @@ def handle_enter_product_id(message):
     # Получаем доступные размеры
     actual_product_id = get_product_field(product, 'product_id', 0)
     temp_data[user_id]['product_id'] = actual_product_id  # Сохраняем числовой ID для кнопок
+    # Вариации по product_id, если пусто — пробуем по model_id (table_id)
     variations = db_actions.get_product_variations(actual_product_id)
+    if (not variations) and table_id:
+        try:
+            variations = db_actions.get_product_variations_by_model_id(table_id)
+        except Exception:
+            variations = []
     available_sizes = []
     if variations:
         for variation in variations:
             size = get_product_field(variation, 'size', '')
-            quantity = get_product_field(variation, 'quantity', 0)
-            if quantity > 0 and size:
+            quantity = variation.get('quantity', None)
+            if size and (quantity is None or quantity > 0):
                 available_sizes.append(size)
+    # Оставляем только числовые размеры и сортируем по возрастанию
+    import re
+    numeric_sizes = []
+    for s in available_sizes:
+        ss = str(s).strip()
+        m = re.search(r"(\d+(?:[\.,]\d+)?)", ss)
+        if not m:
+            continue
+        try:
+            val = float(m.group(1).replace(',', '.'))
+            numeric_sizes.append((val, ss))
+        except Exception:
+            continue
+    # Удаляем дубликаты по числовому значению, сортируем и формируем отображаемый список
+    seen = set()
+    numeric_sizes_sorted = []
+    for val, ss in sorted(numeric_sizes, key=lambda x: x[0]):
+        if val in seen:
+            continue
+        seen.add(val)
+        # Красиво отображаем: 42.0 -> 42, 42.5 -> 42.5
+        disp = str(int(val)) if val.is_integer() else ("{:.1f}".format(val).rstrip('0').rstrip('.') if val % 1 != 0 else str(int(val)))
+        numeric_sizes_sorted.append(disp)
     
-    # Формируем карточку товара
+    # Формируем карточку товара в требуемом формате (HTML):
+    # Название, Описание, Артикул, Размеры, Цена, Возврат, Хэштеги, Кнопки-ссылки
     caption_parts = []
     
-    # Название товара (жирным)
-    caption_parts.append(f"*{product_name}*")
+    # Название товара
+    caption_parts.append(f"{product_name}")
     
-    # Описание товара (приоритет новому полю, если пустое - используем старое)
+    # Описание товара (приоритет новому полю, если пустое - используем старое; без строк-хэштегов)
     description_to_show = description_full if description_full else description_old
-    if description_to_show and description_to_show.strip():
-        # Убираем хештеги из описания, если они есть
-        description_clean = description_to_show
-        if '\n' in description_clean:
-            lines = description_clean.split('\n')
-            # Ищем строки с хештегами (начинающиеся с #)
-            hashtag_lines = [line for line in lines if line.strip().startswith('#')]
-            if hashtag_lines:
-                # Убираем строки с хештегами из описания
-                description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
-        
-        if description_clean:
-            # Форматируем как blockquote
-            quoted_description = '\n'.join([f"> {line}" for line in description_clean.split('\n')])
-            caption_parts.append(quoted_description)
+    description_clean = description_to_show or ""
+    if description_clean and '\n' in description_clean:
+        lines = description_clean.split('\n')
+        description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
+    if description_clean:
+        caption_parts.append(description_clean)
     
-    # Артикул товара
+    # Блок деталей: Артикул, Размеры, Цена (между ними один перевод строки)
+    details_lines = []
     if table_id and table_id.strip():
-        caption_parts.append(f"🆔 Артикул: `{table_id}`")
-    
-    # Доступные размеры
-    if available_sizes:
-        sizes_text = ", ".join(available_sizes[:10])  # Ограничиваем количество размеров
-        if len(available_sizes) > 10:
-            sizes_text += f" и еще {len(available_sizes) - 10}"
-        caption_parts.append(f"📏 Размеры: {sizes_text}")
-    
-    # Цена
-    if price > 0:
-        caption_parts.append(f"💰 Цена: {price}₽")
+        details_lines.append(f"<b>Артикул: {table_id}</b>")
+    if numeric_sizes_sorted:
+        sizes_text = ", ".join(numeric_sizes_sorted[:10])
+        if len(numeric_sizes_sorted) > 10:
+            sizes_text += f" и еще {len(numeric_sizes_sorted) - 10}"
+        details_lines.append(f"Размеры: {sizes_text}")
     else:
-        caption_parts.append("💰 Цена: Уточняйте")
+        # Fallback: показать сырые размеры из БД, если они есть
+        if available_sizes:
+            uniq_raw = []
+            seen_raw = set()
+            for s in available_sizes:
+                ss = str(s).strip()
+                if ss and ss not in seen_raw:
+                    seen_raw.add(ss)
+                    uniq_raw.append(ss)
+            if uniq_raw:
+                sizes_text = ", ".join(uniq_raw[:10])
+                if len(uniq_raw) > 10:
+                    sizes_text += f" и еще {len(uniq_raw) - 10}"
+                details_lines.append(f"Размеры: {sizes_text}")
+        log_info(logger, f"DEBUG: Sizes not found for preview. product_id={actual_product_id}, table_id={table_id}, variations={len(variations)}, raw_sizes={available_sizes}")
+    price_text = f"Цена: {price}₽" if price and price > 0 else "Цена: Уточняйте"
+    details_lines.append(price_text)
+    if details_lines:
+        caption_parts.append("\n".join(details_lines))
     
-    # Хештеги (извлекаем из описания или используем поле keywords)
-    hashtags_to_show = ""
+    # Ссылки: Купить и Поддержка (как гиперссылки)
+    try:
+        bot_username = bot.get_me().username
+    except Exception:
+        bot_username = ''
+    deep_link = f"https://t.me/{bot_username}?start=product_{actual_product_id}" if bot_username else ""
+    support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+    link_chunks = []
+    if deep_link:
+        link_chunks.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
+    if support_link:
+        link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+    if link_chunks:
+        caption_parts.append(" | ".join(link_chunks))
     
-    # Сначала пытаемся извлечь хештеги из описания
+    # Возврат
+    caption_parts.append("Возврат в течение 14 дней")
+    
+    # Хэштеги (из описания или keywords)
+    hashtags_to_show = ''
     if description_to_show and '\n' in description_to_show:
-        lines = description_to_show.split('\n')
-        hashtag_lines = [line.strip() for line in lines if line.strip().startswith('#')]
-        if hashtag_lines:
-            hashtags_to_show = ' '.join(hashtag_lines)
-    
-    # Если хештеги не найдены в описании, используем поле keywords
+        h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
+        if h_lines:
+            hashtags_to_show = ' '.join(h_lines)
     if not hashtags_to_show and keywords and keywords.strip():
         hashtags_to_show = keywords.strip()
-    
-    # Добавляем хештеги в конец
     if hashtags_to_show:
-        caption_parts.append(f"\n{hashtags_to_show}")
+        caption_parts.append(f"{hashtags_to_show}")
     
     caption = "\n\n".join(caption_parts)
     
-    # Превью: отправляем медиа-группу если есть фото, иначе текстовое сообщение
+    # Превью: отправляем медиа-группу если есть фото, иначе текстовое сообщение (HTML)
     if photos:
         media = []
         for idx, p in enumerate(photos[:10]):
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption, parse_mode="Markdown"))
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption, parse_mode="HTML"))
             else:
                 media.append(types.InputMediaPhoto(open(p, 'rb')))
         bot.send_media_group(user_id, media)
     else:
-        # Отправляем текстовое сообщение с предпросмотром
-        bot.send_message(user_id, caption, parse_mode="Markdown")
+        bot.send_message(user_id, caption, parse_mode="HTML")
     
     # Кнопки
     markup = types.InlineKeyboardMarkup()
@@ -1911,13 +2127,90 @@ def handle_post_publish(call):
         if not hashtags_to_show and keywords:
             hashtags_to_show = keywords.strip()
 
+        # Формируем подпись в требуемом формате (HTML):
+        # Фото (идет отдельно), Название, Описание, Артикул, Размеры, Цена,
+        # Возврат, Хэштеги, Кнопки-ссылки
         parts = []
         parts.append(f"{name}")
         if description_clean:
             parts.append(f"{description_clean}")
         if table_id:
-            parts.append(f"Артикул: {table_id}")
+            parts.append(f"<b>Артикул: {table_id}</b>")
+        # Размеры
+        try:
+            variations = db_actions.get_product_variations(int(product_id)) if product else []
+            if (not variations) and table_id:
+                variations = db_actions.get_product_variations_by_model_id(table_id)
+        except Exception:
+            variations = []
+        available_sizes = []
+        if variations:
+            for v in variations:
+                size = get_product_field(v, 'size', '')
+                quantity = v.get('quantity', None)
+                if size and (quantity is None or quantity > 0):
+                    available_sizes.append(size)
+        # Числовая фильтрация и сортировка размеров
+        import re
+        numeric_sizes = []
+        for s in available_sizes:
+            ss = str(s).strip()
+            m = re.search(r"(\d+(?:[\.,]\d+)?)", ss)
+            if not m:
+                continue
+            try:
+                val = float(m.group(1).replace(',', '.'))
+                numeric_sizes.append((val, ss))
+            except Exception:
+                continue
+        seen = set()
+        numeric_sizes_sorted = []
+        for val, ss in sorted(numeric_sizes, key=lambda x: x[0]):
+            if val in seen:
+                continue
+            seen.add(val)
+            disp = str(int(val)) if val.is_integer() else ("{:.1f}".format(val).rstrip('0').rstrip('.') if val % 1 != 0 else str(int(val)))
+            numeric_sizes_sorted.append(disp)
+        if numeric_sizes_sorted:
+            sizes_text = ", ".join(numeric_sizes_sorted[:10])
+            if len(numeric_sizes_sorted) > 10:
+                sizes_text += f" и еще {len(numeric_sizes_sorted) - 10}"
+            parts.append(f"Размеры: {sizes_text}")
+        else:
+            # Fallback на сырые размеры
+            if available_sizes:
+                uniq_raw = []
+                seen_raw = set()
+                for s in available_sizes:
+                    ss = str(s).strip()
+                    if ss and ss not in seen_raw:
+                        seen_raw.add(ss)
+                        uniq_raw.append(ss)
+                if uniq_raw:
+                    sizes_text = ", ".join(uniq_raw[:10])
+                    if len(uniq_raw) > 10:
+                        sizes_text += f" и еще {len(uniq_raw) - 10}"
+                    parts.append(f"Размеры: {sizes_text}")
+            log_info(logger, f"DEBUG: Sizes not found for publish-from-preview. product_id={product_id}, table_id={table_id}, variations={len(variations)}, raw_sizes={available_sizes}")
+        # Цена
         parts.append(f"Цена: {price}₽")
+        # Кнопки-ссылки
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = ''
+        deep_link = f"https://t.me/{bot_username}?start=product_{product_id}" if bot_username else ""
+        support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+        link_chunks = []
+        if deep_link:
+            link_chunks.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
+        if support_link:
+            link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+        if link_chunks:
+            parts.append(" | ".join(link_chunks))
+        # Возврат
+        parts.append("Возврат в течение 14 дней")
+        # Хэштеги
         if hashtags_to_show:
             parts.append(f"{hashtags_to_show}")
         caption = "\n\n".join(parts)
@@ -1927,7 +2220,7 @@ def handle_post_publish(call):
         media = []
         for idx, p in enumerate(files[:10]):
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption))
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption, parse_mode="HTML"))
             else:
                 media.append(types.InputMediaPhoto(open(p, 'rb')))
         # Публикация
@@ -1956,13 +2249,83 @@ def handle_new_caption(message):
     user_id = message.from_user.id
     data = temp_data.get(user_id) or {}
     files = data.get('photos', [])
-    new_caption = message.text
-    # Покажем обновлённый предпросмотр
+    new_text = message.text or ""
+    # Пересобираем подпись по тому же шаблону предпросмотра
     try:
+        product_id = data.get('product_id')
+        product = db_actions.get_product(int(product_id)) if product_id and str(product_id).isdigit() else None
+        product_name = get_product_field(product, 'name', 'Неизвестно') if product else f"Товар {product_id}"
+        description_full = get_product_field(product, 'description_full', '') if product else ''
+        description_old = get_product_field(product, 'description', '') if product else ''
+        table_id = get_product_field(product, 'table_id', '') if product else ''
+        keywords = get_product_field(product, 'keywords', '') if product else ''
+        price = get_product_field(product, 'price', 0) if product else 0
+
+        # Размеры
+        try:
+            variations = db_actions.get_product_variations(int(product_id)) if product else []
+        except Exception:
+            variations = []
+        available_sizes = []
+        if variations:
+            for v in variations:
+                size = get_product_field(v, 'size', '')
+                quantity = get_product_field(v, 'quantity', 0)
+                if quantity > 0 and size:
+                    available_sizes.append(size)
+
+        # Ссылки
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = ''
+        deep_link = f"https://t.me/{bot_username}?start=product_{product_id}" if bot_username else ""
+        support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+
+        # Хэштеги: из исходного описания или keywords
+        description_to_show = description_full if description_full else description_old
+        hashtags_to_show = ''
+        if description_to_show and '\n' in description_to_show:
+            h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
+            if h_lines:
+                hashtags_to_show = ' '.join(h_lines)
+        if not hashtags_to_show and keywords and keywords.strip():
+            hashtags_to_show = keywords.strip()
+
+        # Описание заменяем на новый текст пользователя (без строк-хэштегов)
+        description_clean = new_text
+        if description_clean and '\n' in description_clean:
+            _lines = description_clean.split('\n')
+            description_clean = '\n'.join([ln for ln in _lines if not ln.strip().startswith('#')]).strip()
+
+        parts = []
+        parts.append(f"{product_name}")
+        if description_clean:
+            parts.append(f"{description_clean}")
+        if table_id:
+            parts.append(f"<b>Артикул: {table_id}</b>")
+        if available_sizes:
+            sizes_text = ", ".join(available_sizes[:10])
+            if len(available_sizes) > 10:
+                sizes_text += f" и еще {len(available_sizes) - 10}"
+            parts.append(f"Размеры: {sizes_text}")
+        parts.append(f"Цена: {price}₽")
+        link_chunks = []
+        if deep_link:
+            link_chunks.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
+        if support_link:
+            link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+        if link_chunks:
+            parts.append(" | ".join(link_chunks))
+        parts.append("Возврат в течение 14 дней")
+        if hashtags_to_show:
+            parts.append(f"{hashtags_to_show}")
+        rebuilt_caption = "\n\n".join(parts)
+
         media = []
         for idx, p in enumerate(files[:10]):
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=new_caption, parse_mode="Markdown"))
+                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=rebuilt_caption, parse_mode="HTML"))
             else:
                 media.append(types.InputMediaPhoto(open(p, 'rb')))
         bot.send_media_group(user_id, media)
@@ -2015,12 +2378,12 @@ def order_status_command(message):
         bot.send_message(user_id, 
             "Использование: /order_status [order_id] [status]\n\n"
             "Примеры статусов:\n"
-            "• new - Новый\n"
-            "• confirmed - Подтвержден\n" 
-            "• paid - Оплачен\n"
-            "• shipped - Отправлен\n"
-            "• delivered - Доставлен\n"
-            "• cancelled - Отменен"
+            "• НОВЫЙ\n"
+            "• ПОДТВЕРЖДЕН\n" 
+            "• ОПЛАЧЕН\n"
+            "• ОТПРАВЛЕН\n"
+            "• ДОСТАВЛЕН\n"
+            "• ОТМЕНЕН"
         )
         return
         
@@ -2570,8 +2933,59 @@ def publish_product_to_channel(product):
         if description:
             caption_parts.append(f"{description}")
         if table_id:
-            caption_parts.append(f"Артикул: {table_id}")
+            caption_parts.append(f"<b>Артикул: {table_id}</b>")
         caption_parts.append(f"Цена: {price}₽")
+
+        # Размеры (если есть в базе)
+        try:
+            variations = db_actions.get_product_variations(product.get('product_id'))
+            available_sizes = [v['size'] for v in variations if v.get('quantity', 0) > 0 and v.get('size')]
+        except Exception:
+            available_sizes = []
+        # Отсортируем и покажем только числовые размеры
+        import re
+        numeric_sizes = []
+        for s in available_sizes:
+            ss = str(s).strip()
+            m = re.search(r"(\d+(?:[\.,]\d+)?)", ss)
+            if not m:
+                continue
+            try:
+                val = float(m.group(1).replace(',', '.'))
+                numeric_sizes.append((val, ss))
+            except Exception:
+                continue
+        seen = set()
+        numeric_sizes_sorted = []
+        for val, ss in sorted(numeric_sizes, key=lambda x: x[0]):
+            if val in seen:
+                continue
+            seen.add(val)
+            disp = str(int(val)) if val.is_integer() else ("{:.1f}".format(val).rstrip('0').rstrip('.') if val % 1 != 0 else str(int(val)))
+            numeric_sizes_sorted.append(disp)
+        if numeric_sizes_sorted:
+            sizes_text = ", ".join(numeric_sizes_sorted[:10])
+            if len(numeric_sizes_sorted) > 10:
+                sizes_text += f" и еще {len(numeric_sizes_sorted) - 10}"
+            caption_parts.append(f"Размеры: {sizes_text}")
+
+        # Ссылки: Купить в один клик и Служба поддержки (HTML)
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = ''
+        deep_link = f"https://t.me/{bot_username}?start=product_{product['product_id']}" if bot_username else ""
+        support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+        links_line = []
+        if deep_link:
+            links_line.append(f"<a href=\"{deep_link}\">Купить в один клик</a>")
+        if support_link:
+            links_line.append(f"<a href=\"{support_link}\">Служба поддержки</a>")
+        if links_line:
+            caption_parts.append(" | ".join(links_line))
+
+        # Политика возврата
+        caption_parts.append("Возврат в течение 14 дней")
         if hashtags:
             caption_parts.append(f"{hashtags}")
         caption = "\n\n".join(caption_parts)
@@ -2580,6 +2994,7 @@ def publish_product_to_channel(product):
             chat_id=chat_id,
             photo=product['photo_id'],
             caption=caption,
+            parse_mode="HTML",
             message_thread_id=topic_id
         )
         
@@ -2803,7 +3218,15 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
         log_info(logger, f"DEBUG: keywords: {repr(keywords)}")
         
         # Получаем доступные размеры
+        # Вариации по product_id, если пусто — пробуем по model_id (table_id)
         variations = db_actions.get_product_variations(actual_product_id)
+        if not variations:
+            try:
+                model_id = get_product_field(product, 'table_id', '') or get_product_field(product, 'article', '')
+                if model_id:
+                    variations = db_actions.get_product_variations_by_model_id(model_id)
+            except Exception:
+                variations = []
         available_sizes = []
         if variations:
             for variation in variations:
@@ -2818,8 +3241,8 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
         else:
             price_text = f"💎 Цена: {coin_price} BS Coin"
         
-        # Формируем карточку товара строго в формате:
-        # Название, Описание, Артикул, Цена, Хэштеги
+        # Формируем карточку товара для группы:
+        # Название, Описание, Артикул (жирный), Размеры, Цена, Ссылки, Возврат, Хэштеги
         caption_parts = []
         caption_parts.append(f"{product_name}")
         
@@ -2833,10 +3256,69 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
             if description_clean:
                 caption_parts.append(description_clean)
         
+        # Блок деталей: Артикул, Размеры, Цена — одним блоком, одинарные переносы
+        details_lines = []
         if product_table_id:
-            caption_parts.append(f"Артикул: {product_table_id}")
-        
-        caption_parts.append(f"{price_text.replace('💰 ', '').replace('💎 ', '')}")
+            details_lines.append(f"<b>Артикул: {product_table_id}</b>")
+        sizes_text = None
+        if available_sizes:
+            import re
+            numeric_sizes = []
+            for s in available_sizes:
+                ss = str(s).strip()
+                m = re.search(r"(\d+(?:[\.,]\d+)?)", ss)
+                if not m:
+                    continue
+                try:
+                    val = float(m.group(1).replace(',', '.'))
+                    numeric_sizes.append((val, ss))
+                except Exception:
+                    continue
+            seen = set()
+            numeric_sizes_sorted = []
+            for val, ss in sorted(numeric_sizes, key=lambda x: x[0]):
+                if val in seen:
+                    continue
+                seen.add(val)
+                disp = str(int(val)) if val.is_integer() else ("{:.1f}".format(val).rstrip('0').rstrip('.') if val % 1 != 0 else str(int(val)))
+                numeric_sizes_sorted.append(disp)
+            if numeric_sizes_sorted:
+                sizes_text = ", ".join(numeric_sizes_sorted[:10])
+                if len(numeric_sizes_sorted) > 10:
+                    sizes_text += f" и еще {len(numeric_sizes_sorted) - 10}"
+            else:
+                uniq_raw = []
+                seen_raw = set()
+                for s in available_sizes:
+                    ss = str(s).strip()
+                    if ss and ss not in seen_raw:
+                        seen_raw.add(ss)
+                        uniq_raw.append(ss)
+                if uniq_raw:
+                    sizes_text = ", ".join(uniq_raw[:10])
+                    if len(uniq_raw) > 10:
+                        sizes_text += f" и еще {len(uniq_raw) - 10}"
+        if sizes_text:
+            details_lines.append(f"Размеры: {sizes_text}")
+        details_lines.append(f"{price_text.replace('💰 ', '').replace('💎 ', '')}")
+        if details_lines:
+            caption_parts.append("\n".join(details_lines))
+
+        # Ссылки: Купить в один клик и Служба поддержки
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = ''
+        support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+        links_line = []
+        links_line.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
+        if support_link:
+            links_line.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+        if links_line:
+            caption_parts.append(" \n ".join(links_line))
+
+        # Политика возврата
+        caption_parts.append("Возврат в течение 14 дней")
         
         hashtags_to_show = ""
         if description_to_show and '\n' in description_to_show:
@@ -2862,11 +3344,7 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
             media = []
             
             # Первое фото с caption
-            media.append(types.InputMediaPhoto(
-                photos[0], 
-                caption=caption,
-                parse_mode="Markdown"
-            ))
+            media.append(types.InputMediaPhoto(photos[0], caption=caption, parse_mode="HTML"))
 
             # Остальные фото без caption
             for photo in photos[1:]:
@@ -2882,11 +3360,7 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
                 print(f"Ошибка отправки медиагруппы: {e}")
                 # Пробуем отправить текстовое сообщение
                 try:
-                    bot.send_message(
-                        chat_id=channel_id,
-                        text=caption,
-                        parse_mode="Markdown"
-                    )
+                    bot.send_message(chat_id=channel_id, text=caption, parse_mode="HTML")
                     return True
                 except Exception as e2:
                     print(f"Ошибка отправки текста: {e2}")
@@ -2894,11 +3368,7 @@ def publish_post_to_channel(table_id, photos, text, is_exclusive, coin_price=0):
         else:
             # Если нет фото, отправляем текстовое сообщение
             try:
-                bot.send_message(
-                    chat_id=channel_id,
-                    text=caption,
-                    parse_mode="Markdown"
-                )
+                bot.send_message(chat_id=channel_id, text=caption, parse_mode="HTML")
                 return True
             except Exception as e:
                 print(f"Ошибка отправки текста: {e}")
@@ -3244,8 +3714,14 @@ def confirm_order_final(message):
             # Проверяем достижение первого заказа
             user_data = db_actions.get_user_data(user_id)
             if user_data and user_data['orders'] == 1:
-                db_actions.add_achievement(user_id, "first_order")
-                db_actions.update_user_stats(user_id, 'bs_coin', 50)
+                achievement_data = ACHIEVEMENTS.get('first_purchase') or {
+                    'name': '🎉 Первый заказ',
+                    'description': 'Сделал первый заказ',
+                    'category': 'ПОКУПКИ',
+                    'bs_coin_reward': 50,
+                    'discount_bonus': 0
+                }
+                db_actions.add_achievement(user_id, "first_purchase", achievement_data)
                 bot.send_message(
                     user_id,
                     "🎉 Вы получили достижение «Первый заказ» +50 BS Coin!"
@@ -3708,28 +4184,7 @@ def handle_order_approval(call):
             bot.answer_callback_query(call.id, "❌ Заказ не найден")
             return
 
-        if order_info['user_id'] == admin_id:
-            print(f"❌ ВНИМАНИЕ: order_info user_id совпадает с admin_id! Ищем последний заказ...")
-            
-            try:
-                all_orders = db_actions._DbAct__db.db_read(
-                    'SELECT order_id, user_id FROM orders_detailed ORDER BY order_id DESC LIMIT 5'
-                )
-                print(f"DEBUG: Последние заказы: {all_orders}")
-                
-                for order in all_orders:
-                    if order[1] != admin_id:
-                        order_info = db_actions.get_order_by_id(order[0])
-                        print(f"DEBUG: Используем заказ: {order[0]} с user_id: {order[1]}")
-                        break
-                
-            except Exception as e:
-                print(f"Ошибка поиска последних заказов: {e}")
-        
-
-        if order_info['user_id'] == admin_id:
-            bot.answer_callback_query(call.id, "❌ Ошибка: неверный заказ")
-            return
+        # Убираем особую обработку совпадения user_id и admin_id — обрабатываем заказ как обычный
             
         user_data = db_actions.get_user_data(order_info['user_id'])
         product = db_actions.get_product(order_info['product_id'])

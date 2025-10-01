@@ -1,5 +1,6 @@
 import os
 import pymysql
+import time
 from threading import Lock
 from datetime import datetime
 import logging
@@ -26,18 +27,7 @@ class DB:
             # Убеждаемся, что база данных существует
             self.__ensure_database()
 
-            self.__db = pymysql.connect(
-                host=self.__host,
-                user=self.__user,
-                password=self.__password,
-                database=self.__database,
-                port=self.__port,
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor,
-                connect_timeout=5,
-                read_timeout=5,
-                write_timeout=5
-            )
+            self.__db = self._connect()
             self.__cursor = self.__db.cursor()
             
             # Создание таблиц
@@ -48,31 +38,125 @@ class DB:
             log_error(logger, e, "Ошибка подключения к MySQL")
             raise
 
-    def __ensure_database(self):
-        """Создает базу данных, если она отсутствует, с нужной кодировкой."""
+    def _connect(self):
+        """Создает новое соединение с БД."""
+        return pymysql.connect(
+            host=self.__host,
+            user=self.__user,
+            password=self.__password,
+            database=self.__database,
+            port=self.__port,
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=10,
+            read_timeout=10,
+            write_timeout=10,
+            autocommit=False,
+        )
+
+    def ensure_connection(self):
+        """Проверяет соединение и восстанавливает при необходимости."""
         try:
-            tmp_conn = pymysql.connect(
+            if self.__db is None:
+                self.__db = self._connect()
+                self.__cursor = self.__db.cursor()
+                return
+            # ping с авто-реконнектом
+            self.__db.ping(reconnect=True)
+            # если курсор закрыт — пересоздаем
+            try:
+                self.__cursor.execute("SELECT 1")
+            except Exception:
+                self.__cursor = self.__db.cursor()
+        except pymysql.Error as _:
+            # жесткий реконнект
+            try:
+                if self.__cursor:
+                    try:
+                        self.__cursor.close()
+                    except Exception:
+                        pass
+                if self.__db:
+                    try:
+                        self.__db.close()
+                    except Exception:
+                        pass
+            finally:
+                self.__db = self._connect()
+                self.__cursor = self.__db.cursor()
+
+    def __ensure_database(self):
+        """Проверяет доступность целевой БД; при отсутствии — создаёт с ретраями."""
+        # 1) Сначала пробуем подключиться напрямую к целевой базе — если уже есть, выходим
+        try:
+            test_conn = pymysql.connect(
                 host=self.__host,
                 user=self.__user,
                 password=self.__password,
+                database=self.__database,
                 port=self.__port,
                 charset='utf8mb4',
                 cursorclass=pymysql.cursors.DictCursor,
                 connect_timeout=5,
                 read_timeout=5,
-                write_timeout=5
+                write_timeout=5,
             )
             try:
-                with tmp_conn.cursor() as cur:
-                    cur.execute(
-                        f"CREATE DATABASE IF NOT EXISTS `{self.__database}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                tmp_conn.commit()
+                with test_conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                test_conn.commit()
             finally:
-                tmp_conn.close()
-        except pymysql.Error as e:
-            log_error(logger, e, "Ошибка создания базы данных")
-            raise
+                test_conn.close()
+            return
+        except pymysql.OperationalError as e:
+            # 1049: Unknown database — нужно создать
+            if not (e.args and e.args[0] == 1049):
+                # Иные ошибки — пробрасываем (таймауты/аутентификация и т.п.)
+                log_error(logger, e, "Ошибка проверки существования базы данных")
+                raise
+
+        # 2) Создаём базу с ретраями, если её нет
+        attempts = 5
+        base_delay_seconds = 2
+        last_err = None
+        for attempt in range(1, attempts + 1):
+            try:
+                tmp_conn = pymysql.connect(
+                    host=self.__host,
+                    user=self.__user,
+                    password=self.__password,
+                    port=self.__port,
+                    charset='utf8mb4',
+                    cursorclass=pymysql.cursors.DictCursor,
+                    connect_timeout=10,
+                    read_timeout=10,
+                    write_timeout=10
+                )
+                try:
+                    with tmp_conn.cursor() as cur:
+                        cur.execute(
+                            f"CREATE DATABASE IF NOT EXISTS `{self.__database}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                        )
+                    tmp_conn.commit()
+                finally:
+                    tmp_conn.close()
+                return
+            except pymysql.OperationalError as e:
+                last_err = e
+                if e.args and e.args[0] in (2006, 2013, 2014, 2017, 2055):
+                    delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                    log_info(logger, f"Повторная попытка создания БД ({attempt}/{attempts}) через {delay_seconds}s из-за: {e}")
+                    time.sleep(delay_seconds)
+                    continue
+                else:
+                    log_error(logger, e, "Ошибка создания базы данных")
+                    raise
+            except pymysql.Error as e:
+                log_error(logger, e, "Ошибка создания базы данных")
+                raise
+        if last_err:
+            log_error(logger, last_err, "Ошибка создания базы данных после ретраев")
+            raise last_err
 
     def create_tables(self):
         try:
@@ -173,7 +257,7 @@ class DB:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            ''')
+            ''')    
             
             # Таблица pending_reviews
             self.__cursor.execute('''
@@ -324,35 +408,60 @@ class DB:
             log_error(logger, e, "❌ Ошибка миграции products")
 
     def db_write(self, query, params=None):
+        self.set_lock()
         try:
-            self.set_lock()
+            self.ensure_connection()
             cursor = self.__db.cursor()
-            
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-                
-            self.__db.commit()
-            
-            rows_affected = cursor.rowcount
-            logger.debug(f"DB_WRITE: query='{query}', params={params}, rows_affected={rows_affected}")
-            
-            return rows_affected
-            
+            try:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                self.__db.commit()
+                rows_affected = cursor.rowcount
+                logger.debug(f"DB_WRITE: query='{query}', params={params}, rows_affected={rows_affected}")
+                return rows_affected
+            except pymysql.OperationalError as e:
+                # Ошибки потери соединения: 2006 (MySQL server has gone away), 2013 (Lost connection during query)
+                if e.args and e.args[0] in (2006, 2013, 2014, 2017, 2055):
+                    log_info(logger, "Обнаружен разрыв соединения, выполняю реконнект и повтор" )
+                    self.ensure_connection()
+                    cursor = self.__db.cursor()
+                    if params:
+                        cursor.execute(query, params)
+                    else:
+                        cursor.execute(query)
+                    self.__db.commit()
+                    return cursor.rowcount
+                raise
         except pymysql.Error as e:
             log_error(logger, e, f"Ошибка записи в БД. Query: {query}, Params: {params}")
-            self.__db.rollback()
+            try:
+                self.__db.rollback()
+            except Exception:
+                pass
             return 0
         finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
             self.realise_lock()
-            cursor.close()
 
     def db_read(self, query, args=()):
         self.set_lock()
         try:
-            self.__cursor.execute(query, args)
-            return self.__cursor.fetchall()
+            self.ensure_connection()
+            try:
+                self.__cursor.execute(query, args)
+                return self.__cursor.fetchall()
+            except pymysql.OperationalError as e:
+                if e.args and e.args[0] in (2006, 2013, 2014, 2017, 2055):
+                    log_info(logger, "Разрыв соединения при чтении, реконнект и повтор")
+                    self.ensure_connection()
+                    self.__cursor.execute(query, args)
+                    return self.__cursor.fetchall()
+                raise
         except pymysql.Error as e:
             log_error(logger, e, "❌ Ошибка чтения из БД")
             return []

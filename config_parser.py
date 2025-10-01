@@ -21,7 +21,7 @@ class ConfigParser:
                 'user': 'root',
                 'password': '12345678',
                 'database': 'bridgeside_bot',
-                'port': 8000
+                'port': 3306
             },
             'yadisk': {
                 'client_id': '',

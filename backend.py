@@ -638,7 +638,7 @@ class DbAct:
             log_info(logger, "DEBUG: Найдены вариации: {variation_data}")
             
             if not variation_data:
-                log_error(logger, e, "❌ Вариация не найдена - product_id: {product_id}, size: {size}")
+                log_error(logger, "❌ Вариация не найдена - product_id: {product_id}, size: {size}")
                 return None
                 
             variation_id = variation_data[0]['variation_id']
@@ -646,29 +646,31 @@ class DbAct:
             
             # Проверяем достаточность товара
             if current_quantity <= 0:
-                log_error(logger, e, "❌ Товара нет в наличии - product_id: {product_id}, size: {size}")
+                log_error(logger, "❌ Товара нет в наличии - product_id: {product_id}, size: {size}")
                 return None
                 
             log_info(logger, "DEBUG: Используем variation_id: {variation_id}, количество: {current_quantity}")
             
-            # Создаем запись в базе
-            result = self.__db.db_write(
+            # Создаем запись в базе и получаем order_id, не обращаясь к приватным полям DB
+            insert_result = self.__db.db_write(
                 '''INSERT INTO orders_detailed 
                 (user_id, product_id, variation_id, quantity, city, address, full_name, phone, delivery_type) 
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                 (user_id, product_id, variation_id, 1, city, address, full_name, phone, delivery_type)
             )
+            order_id_data = self.__db.db_read('SELECT LAST_INSERT_ID() as last_id') if insert_result else []
+            order_id = order_id_data[0]['last_id'] if order_id_data else None
             
             # Уменьшаем количество товара
-            if result:
+            if order_id:
                 success = self.__db.db_write(
                     'UPDATE product_variations SET quantity = quantity - 1 WHERE variation_id = %s AND quantity > 0',
                     (variation_id,)
                 )
                 log_info(logger, "DEBUG: Уменьшение количества - success: {success}")
                 
-            log_info(logger, "DEBUG: Результат создания заказа: {result}")
-            return result
+            log_info(logger, "DEBUG: Создан заказ с ID: {order_id}")
+            return order_id
             
         except Exception as e:
             log_error(logger, e, "Ошибка создания заказа: {e}")
@@ -764,6 +766,32 @@ class DbAct:
         except Exception as e:
             log_error(logger, e, "Ошибка получения вариаций: {e}")
             return []
+
+    def get_product_variations_by_model_id(self, model_id):
+        """Возвращает вариации по строковому идентификатору модели (например, M1906DD)."""
+        try:
+            data = self.__db.db_read(
+                'SELECT * FROM product_variations WHERE model_id = %s',
+                (str(model_id),)
+            )
+            variations = []
+            for row in data:
+                variation = {
+                    'variation_id': row['variation_id'],
+                    'product_id': row['product_id'],
+                    'model_id': row['model_id'],
+                    'size': str(row['size']),
+                    'quantity': row['quantity'],
+                    'price': row['price'],
+                    'price_yuan': row['price_yuan'],
+                    'link': row['link']
+                }
+                log_info(logger, "DEBUG Variation by model_id: {variation}")
+                variations.append(variation)
+            return variations
+        except Exception as e:
+            log_error(logger, e, "Ошибка получения вариаций по model_id: {e}")
+            return []
     
     def check_size_availability(self, product_id, size):
         """Проверяет доступность размера"""
@@ -812,3 +840,15 @@ class DbAct:
         except Exception as e:
             log_error(logger, e, "Ошибка возврата товара: {e}")
             return False
+
+    def get_user_orders(self, user_id, limit=50):
+        """Возвращает список заказов пользователя (последние по дате)."""
+        try:
+            rows = self.__db.db_read(
+                'SELECT order_id, product_id, status, created_at FROM orders_detailed WHERE user_id = %s ORDER BY created_at DESC LIMIT %s',
+                (user_id, limit)
+            )
+            return rows or []
+        except Exception as e:
+            log_error(logger, e, "Ошибка получения заказов пользователя: {e}")
+            return []
