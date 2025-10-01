@@ -170,6 +170,22 @@ class DbAct:
         data = self.__db.db_read('SELECT * FROM products WHERE table_id = %s', (table_id,))
         return data[0] if data else None
 
+    def get_product_by_model_id(self, model_id):
+        """Получить товар по model_id из вариаций (join по product_id)."""
+        try:
+            log_info(logger, f"DEBUG get_product_by_model_id: model_id = {model_id}")
+            data = self.__db.db_read(
+                '''SELECT p.* FROM products p 
+                   JOIN product_variations pv ON pv.product_id = p.product_id 
+                   WHERE pv.model_id = %s 
+                   LIMIT 1''',
+                (str(model_id),)
+            )
+            return data[0] if data else None
+        except Exception as e:
+            log_error(logger, e, f"Ошибка get_product_by_model_id для {model_id}")
+            return None
+
     def create_order(self, user_id, product_id, quantity):
         return self.__db.db_write(
             '''INSERT INTO orders (user_id, product_id, quantity) 
@@ -298,6 +314,17 @@ class DbAct:
             ORDER BY r.created_at DESC LIMIT %s''',
             (limit,)
         )
+
+    def get_user_reviews(self, user_id):
+        """Получить все отзывы пользователя."""
+        try:
+            return self.__db.db_read(
+                'SELECT review_id, user_id, text, photo_url, created_at FROM reviews WHERE user_id = %s ORDER BY created_at DESC',
+                (user_id,)
+            )
+        except Exception as e:
+            log_error(logger, e, f"Ошибка получения отзывов пользователя {user_id}")
+            return []
 
     
     def get_all_users(self):

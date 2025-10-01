@@ -286,7 +286,14 @@ def yadisk_list_images(product_id: str) -> list:
     r.raise_for_status()
     data = r.json()
     items = (data.get("_embedded") or {}).get("items", [])
-    return [it["path"] for it in items if it.get("type") == "file" and (it.get("media_type") or "").startswith("image")]
+    # Берем только изображения с префиксом forbot_
+    return [
+        it["path"]
+        for it in items
+        if it.get("type") == "file"
+        and (it.get("media_type") or "").startswith("image")
+        and str(it.get("name", "")).startswith("forbot_")
+    ]
 
 def yadisk_get_download_href(file_path: str) -> str:
     token = get_yadisk_tokens()
@@ -382,6 +389,9 @@ def show_product(user_id, product_id):
     description_full = get_product_field(product, 'description_full', '')
     description_old = get_product_field(product, 'description', '')
     table_id = get_product_field(product, 'table_id', '')
+    # Фолбэк: если в products.table_id пусто, показываем введённый админом артикул
+    if table_id is None or not str(table_id).strip():
+        table_id = temp_data.get(user_id, {}).get('table_id', product_id)
     keywords = get_product_field(product, 'keywords', '')
     price = get_product_field(product, 'price', 0)
     
@@ -407,8 +417,8 @@ def show_product(user_id, product_id):
             caption_parts.append(quoted_description)
     
     # Артикул товара
-    if table_id and table_id.strip():
-        caption_parts.append(f"🆔 Артикул: `{table_id}`")
+    if table_id is not None and str(table_id).strip():
+        caption_parts.append(f"🆔 Артикул: `{str(table_id).strip()}`")
     
     # Цена
     if price > 0:
@@ -799,19 +809,16 @@ def send_review_for_moderation(user_id, review_data):
                 }
                 if topic_id:
                     photo_params["message_thread_id"] = topic_id
-                    
-                message = bot.send_photo(**photo_params)
-            pending_reviews[review_id]['message_id'] = message.message_id
-            
+                msg_one = bot.send_photo(**photo_params)
+                pending_reviews[review_id]['message_id'] = msg_one.message_id
                 # Остальные фото по отдельности
-            for photo in review_data['photos'][1:]:
+                for photo in review_data['photos'][1:]:
                     single_photo_params = {
                         "chat_id": admin_group_id,
                         "photo": photo
                     }
                     if topic_id:
                         single_photo_params["message_thread_id"] = topic_id
-                        
                     bot.send_photo(**single_photo_params)
         else:
             text_params = {
@@ -1257,55 +1264,11 @@ def show_reviews(message):
     clear_temp_data(user_id)
     buttons = Bot_inline_btns()
     
-    try:
-        reviews = db_actions.get_reviews()
-        
-        # Отладочная информация
-        log_info(logger, f"Получено отзывов: {len(reviews) if reviews else 0}")
-        
-        if not reviews or len(reviews) == 0:
-            bot.send_message(user_id, "Пока нет отзывов. Будьте первым!", reply_markup=buttons.reviews_buttons())
-            return
-        
-        reviews_msg = "🔥 Последние отзывы:\n\n"
-        
-        for i, review in enumerate(reviews[:3]):
-            try:
-                log_info(logger, f"Обрабатываем отзыв {i}: {review}, тип: {type(review)}")
-                
-                # Конвертируем review в список, если это возможно
-                if hasattr(review, '__iter__') and not isinstance(review, str):
-                    review_list = list(review)
-                else:
-                    review_list = [review]
-                
-                log_info(logger, f"Отзыв {i} как список: {review_list}, длина: {len(review_list)}")
-                
-                # Безопасное получение данных
-                review_text = "Текст отзыва"
-                user_name = "Пользователь"
-                
-                if len(review_list) > 2:
-                    review_text = str(review_list[2]) if review_list[2] else "Текст отзыва"
-                
-                if len(review_list) > 5:
-                    user_name = str(review_list[5]) if review_list[5] else "Пользователь"
-                
-                reviews_msg += f"⭐️ {review_text}\n— {user_name}\n\n"
-                
-            except Exception as e:
-                log_error(logger, e, f"Ошибка обработки отзыва {i}: {review}")
-                reviews_msg += f"⭐️ Текст отзыва\n— Пользователь\n\n"
-    
-        bot.send_message(
-            user_id,
-            reviews_msg,
-            reply_markup=buttons.reviews_buttons()
-        )
-        
-    except Exception as e:
-        log_error(logger, e, "Ошибка в функции show_reviews")
-        bot.send_message(user_id, "❌ Ошибка при загрузке отзывов", reply_markup=buttons.reviews_buttons())
+    text = (
+        "📢 Раздел отзывов\n\n"
+        "Здесь вы можете оставить свой отзыв или посмотреть все отзывы, нажав на кнопку ниже."
+    )
+    bot.send_message(user_id, text, reply_markup=buttons.reviews_buttons())
 
 @bot.message_handler(func=lambda msg: msg.text == '🏆 Ачивки')
 def show_achievements_menu(message):
@@ -1414,6 +1377,14 @@ def handle_support_decision(call):
         bot.answer_callback_query(call.id, "Принято")
         bot.edit_message_reply_markup(chat_id=chat_id, message_id=data.get('support_message_id'), reply_markup=None)
         bot.send_message(user_id, "✅ Оператор подключился. Напишите ваше сообщение — мы ответим.")
+        # Инструкция только для админа в топике
+        try:
+            admin_note_kwargs = {"chat_id": chat_id, "text": "Чтобы завершить диалог, напишите /close_support"}
+            if topic_id:
+                admin_note_kwargs["message_thread_id"] = topic_id
+            bot.send_message(**admin_note_kwargs)
+        except Exception:
+            pass
         # Пометим связку для релея сообщений
         temp_data[user_id]['relay'] = {
             'chat_id': chat_id,
@@ -1914,6 +1885,11 @@ def handle_enter_product_id(message):
     if user_id not in temp_data or temp_data[user_id].get('step') != 'await_product_id':
         bot.send_message(user_id, "❌ Сессия неактуальна. Нажмите /create_post")
         return
+    # Проверяем, что пришёл текст (а не файл/фото)
+    if not getattr(message, 'text', None) or not str(message.text).strip():
+        bot.send_message(user_id, "✍️ Введите ID товара текстом (как в таблице/папке Я.Диск):")
+        bot.register_next_step_handler(message, handle_enter_product_id)
+        return
     product_id = message.text.strip()
     # Скачиваем фото
     photos = []
@@ -1928,8 +1904,10 @@ def handle_enter_product_id(message):
     temp_data[user_id]['photos'] = photos
     temp_data[user_id]['table_id'] = product_id  # Сохраняем артикул
     
-    # Получим товар для описания по table_id (артикулу)
+    # Получим товар для описания по table_id (артикулу) или по model_id из вариаций
     product = db_actions.get_product_by_table_id(product_id)
+    if not product:
+        product = db_actions.get_product_by_model_id(product_id)
     if not product:
         bot.send_message(user_id, f"❌ Товар с артикулом {product_id} не найден в базе данных")
         return
@@ -2029,6 +2007,9 @@ def handle_enter_product_id(message):
     if details_lines:
         caption_parts.append("\n".join(details_lines))
     
+    # Возврат
+    caption_parts.append("Возврат в течение 14 дней")
+
     # Ссылки: Купить и Поддержка (как гиперссылки)
     try:
         bot_username = bot.get_me().username
@@ -2043,9 +2024,6 @@ def handle_enter_product_id(message):
         link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
     if link_chunks:
         caption_parts.append(" | ".join(link_chunks))
-    
-    # Возврат
-    caption_parts.append("Возврат в течение 14 дней")
     
     # Хэштеги (из описания или keywords)
     hashtags_to_show = ''
@@ -2108,6 +2086,8 @@ def handle_post_publish(call):
         description_full = get_product_field(product, 'description_full', '') if product else ''
         description_old = get_product_field(product, 'description', '') if product else ''
         table_id = get_product_field(product, 'table_id', '') if product else ''
+        if not table_id or not str(table_id).strip():
+            table_id = temp_data.get(user_id, {}).get('table_id', product_id)
         keywords = get_product_field(product, 'keywords', '') if product else ''
         price = get_product_field(product, 'price', 0) if product else 0
 
@@ -2192,8 +2172,9 @@ def handle_post_publish(call):
                         sizes_text += f" и еще {len(uniq_raw) - 10}"
                     parts.append(f"Размеры: {sizes_text}")
             log_info(logger, f"DEBUG: Sizes not found for publish-from-preview. product_id={product_id}, table_id={table_id}, variations={len(variations)}, raw_sizes={available_sizes}")
-        # Цена
-        parts.append(f"Цена: {price}₽")
+        # Цена (как в предпросмотре)
+        price_text = f"Цена: {price}₽" if price and price > 0 else "Цена: Уточняйте"
+        parts.append(price_text)
         # Кнопки-ссылки
         try:
             bot_username = bot.get_me().username
@@ -2206,10 +2187,10 @@ def handle_post_publish(call):
             link_chunks.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
         if support_link:
             link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+        # Возврат выше ссылок
+        parts.append("Возврат в течение 14 дней")
         if link_chunks:
             parts.append(" | ".join(link_chunks))
-        # Возврат
-        parts.append("Возврат в течение 14 дней")
         # Хэштеги
         if hashtags_to_show:
             parts.append(f"{hashtags_to_show}")
@@ -2219,10 +2200,11 @@ def handle_post_publish(call):
         topic_id = (config_data_local.get('topics') or {}).get('магазин')
         media = []
         for idx, p in enumerate(files[:10]):
+            media_input = _resolve_media_input(p)
             if idx == 0:
-                media.append(types.InputMediaPhoto(open(p, 'rb'), caption=caption, parse_mode="HTML"))
+                media.append(types.InputMediaPhoto(media_input, caption=caption, parse_mode="HTML"))
             else:
-                media.append(types.InputMediaPhoto(open(p, 'rb')))
+                media.append(types.InputMediaPhoto(media_input))
         # Публикация
         bot.send_media_group(chat_id, media, message_thread_id=topic_id)
         bot.answer_callback_query(call.id, "Опубликовано")
@@ -2239,10 +2221,241 @@ def handle_post_publish(call):
 def handle_post_edit(call):
     user_id = call.from_user.id
     bot.answer_callback_query(call.id)
-    bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id,
-                          text="Отправьте новый текст поста (будет в подписи первого фото)")
-    temp_data[user_id]['step'] = 'edit_text'
-    temp_data[user_id]['edit_message_id'] = call.message.message_id
+    # Показать меню редактирования
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(text="🖼 Фото", callback_data="post_editmenu_photos"),
+        types.InlineKeyboardButton(text="🏷 Название", callback_data="post_editmenu_name"),
+    )
+    markup.add(
+        types.InlineKeyboardButton(text="📝 Описание", callback_data="post_editmenu_desc"),
+        types.InlineKeyboardButton(text="💰 Цена", callback_data="post_editmenu_price"),
+    )
+    markup.add(
+        types.InlineKeyboardButton(text="#️⃣ Хэштеги", callback_data="post_editmenu_tags"),
+        types.InlineKeyboardButton(text="🔙 К предпросмотру", callback_data="post_editmenu_back"),
+    )
+    try:
+        bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id,
+                              text="Что хотите отредактировать?", reply_markup=markup)
+    except Exception:
+        bot.send_message(user_id, "Что хотите отредактировать?", reply_markup=markup)
+    temp_data.setdefault(user_id, {})
+    temp_data[user_id]['step'] = 'edit_menu'
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('post_editmenu_'))
+def handle_post_edit_menu(call):
+    user_id = call.from_user.id
+    action = call.data.replace('post_editmenu_', '')
+    bot.answer_callback_query(call.id)
+    if action == 'back':
+        try:
+            _render_post_preview(user_id)
+        except Exception:
+            bot.send_message(user_id, "Не удалось отобразить предпросмотр")
+        return
+    if action == 'photos':
+        temp_data.setdefault(user_id, {})
+        # Удаляем локальные файлы, скачанные ранее с Я.Диска, и очищаем список фото
+        try:
+            existing = temp_data[user_id].get('photos', []) or []
+            local_paths = [p for p in existing if isinstance(p, str) and os.path.exists(p)]
+            if local_paths:
+                cleanup_local_files(local_paths)
+        except Exception:
+            pass
+        temp_data[user_id]['photos'] = []
+        temp_data[user_id]['step'] = 'edit_photos_post'
+        bot.send_message(user_id, "Отправьте 1–10 фото для поста. Первое фото будет с подписью. Отправьте /done когда закончите.")
+    elif action == 'name':
+        temp_data.setdefault(user_id, {})
+        temp_data[user_id]['step'] = 'edit_name_post'
+        bot.send_message(user_id, "Введите новое название модели:")
+    elif action == 'desc':
+        temp_data.setdefault(user_id, {})
+        temp_data[user_id]['step'] = 'edit_desc_post'
+        bot.send_message(user_id, "Введите новое описание:")
+    elif action == 'price':
+        temp_data.setdefault(user_id, {})
+        temp_data[user_id]['step'] = 'edit_price_post'
+        bot.send_message(user_id, "Введите новую цену (число), либо 0 для 'Уточняйте':")
+    elif action == 'tags':
+        temp_data.setdefault(user_id, {})
+        temp_data[user_id]['step'] = 'edit_tags_post'
+        bot.send_message(user_id, "Введите хэштеги (через пробел или перенос строки):")
+
+@bot.message_handler(content_types=['photo'], func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_photos_post')
+def handle_edit_photos_post(message):
+    user_id = message.from_user.id
+    data = temp_data.setdefault(user_id, {})
+    files = data.get('photos', [])
+    try:
+        file_id = message.photo[-1].file_id
+        if not isinstance(files, list):
+            files = []
+        files.append(file_id)
+        files = files[-10:]
+        data['photos'] = files
+        temp_data[user_id] = data
+        bot.send_message(user_id, f"Добавлено фото. Текущих фото: {len(files)}. Отправьте ещё или введите /done для предпросмотра.")
+    except Exception as e:
+        bot.send_message(user_id, f"Не удалось добавить фото: {e}")
+
+@bot.message_handler(commands=['done'])
+def handle_done_editing(message):
+    user_id = message.from_user.id
+    if temp_data.get(user_id, {}).get('step') in ['edit_photos_post', 'edit_name_post', 'edit_desc_post', 'edit_price_post', 'edit_tags_post']:
+        _render_post_preview(user_id)
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_name_post')
+def handle_edit_name_post(message):
+    user_id = message.from_user.id
+    temp_data.setdefault(user_id, {})['override_name'] = (message.text or '').strip()
+    _render_post_preview(user_id)
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_desc_post')
+def handle_edit_desc_post(message):
+    user_id = message.from_user.id
+    temp_data.setdefault(user_id, {})['override_description'] = (message.text or '').strip()
+    _render_post_preview(user_id)
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_price_post')
+def handle_edit_price_post(message):
+    user_id = message.from_user.id
+    txt = (message.text or '').replace(',', '.').strip()
+    try:
+        value = float(txt)
+        temp_data.setdefault(user_id, {})['override_price'] = value
+        _render_post_preview(user_id)
+    except Exception:
+        bot.send_message(user_id, "Введите число, например 4990 или 0")
+
+@bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_tags_post')
+def handle_edit_tags_post(message):
+    user_id = message.from_user.id
+    temp_data.setdefault(user_id, {})['override_tags'] = (message.text or '').strip()
+    _render_post_preview(user_id)
+
+def _resolve_media_input(media_item):
+    try:
+        if isinstance(media_item, str) and os.path.exists(media_item):
+            return open(media_item, 'rb')
+        return media_item
+    except Exception:
+        return media_item
+
+def _render_post_preview(user_id: int):
+    data = temp_data.get(user_id) or {}
+    files = data.get('photos', [])
+    actual_product_id = data.get('product_id')
+    table_id_input = data.get('table_id', '')
+    product = db_actions.get_product(int(actual_product_id)) if actual_product_id and str(actual_product_id).isdigit() else None
+    product_name = data.get('override_name') or (get_product_field(product, 'name', 'Неизвестно') if product else f"Товар {actual_product_id}")
+    description_full = get_product_field(product, 'description_full', '') if product else ''
+    description_old = get_product_field(product, 'description', '') if product else ''
+    table_id = get_product_field(product, 'table_id', '') if product else ''
+    if not table_id or not str(table_id).strip():
+        table_id = table_id_input
+    keywords = get_product_field(product, 'keywords', '') if product else ''
+    price_value = data.get('override_price') if 'override_price' in data else (get_product_field(product, 'price', 0) if product else 0)
+    description_to_show = data.get('override_description') or (description_full if description_full else description_old)
+    description_clean = description_to_show or ''
+    if description_clean and '\n' in description_clean:
+        lines = description_clean.split('\n')
+        description_clean = '\n'.join([ln for ln in lines if not ln.strip().startswith('#')]).strip()
+    # sizes
+    try:
+        variations = db_actions.get_product_variations(int(actual_product_id)) if product else []
+        if (not variations) and table_id:
+            variations = db_actions.get_product_variations_by_model_id(table_id)
+    except Exception:
+        variations = []
+    available_sizes = []
+    if variations:
+        for v in variations:
+            size = get_product_field(v, 'size', '')
+            quantity = v.get('quantity', None)
+            if size and (quantity is None or quantity > 0):
+                available_sizes.append(size)
+    import re as _re
+    numeric_sizes = []
+    for s in available_sizes:
+        ss = str(s).strip()
+        m = _re.search(r"(\d+(?:[\.,]\d+)?)", ss)
+        if not m:
+            continue
+        try:
+            val = float(m.group(1).replace(',', '.'))
+            numeric_sizes.append((val, ss))
+        except Exception:
+            continue
+    seen = set()
+    numeric_sizes_sorted = []
+    for val, ss in sorted(numeric_sizes, key=lambda x: x[0]):
+        if val in seen:
+            continue
+        seen.add(val)
+        disp = str(int(val)) if val.is_integer() else ("{:.1f}".format(val).rstrip('0').rstrip('.') if val % 1 != 0 else str(int(val)))
+        numeric_sizes_sorted.append(disp)
+    # build caption
+    parts = []
+    parts.append(f"{product_name}")
+    if description_clean:
+        parts.append(f"{description_clean}")
+    if table_id:
+        parts.append(f"<b>Артикул: {table_id}</b>")
+    if numeric_sizes_sorted:
+        sizes_text = ", ".join(numeric_sizes_sorted[:10])
+        if len(numeric_sizes_sorted) > 10:
+            sizes_text += f" и еще {len(numeric_sizes_sorted) - 10}"
+        parts.append(f"Размеры: {sizes_text}")
+    price_text = f"Цена: {price_value}₽" if price_value and price_value > 0 else "Цена: Уточняйте"
+    parts.append(price_text)
+    parts.append("Возврат в течение 14 дней")
+    try:
+        bot_username = bot.get_me().username
+    except Exception:
+        bot_username = ''
+    deep_link = f"https://t.me/{bot_username}?start=product_{actual_product_id}" if bot_username else ""
+    support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
+    link_chunks = []
+    if deep_link:
+        link_chunks.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
+    if support_link:
+        link_chunks.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
+    if link_chunks:
+        parts.append(" | ".join(link_chunks))
+    # hashtags
+    hashtags_to_show = data.get('override_tags', '')
+    if not hashtags_to_show and description_to_show and '\n' in (description_to_show or ''):
+        h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
+        if h_lines:
+            hashtags_to_show = ' '.join(h_lines)
+    if not hashtags_to_show and keywords and str(keywords).strip():
+        hashtags_to_show = str(keywords).strip()
+    if hashtags_to_show:
+        parts.append(f"{hashtags_to_show}")
+    caption = "\n\n".join(parts)
+    # send preview
+    if files:
+        media = []
+        for idx, p in enumerate(files[:10]):
+            media_input = _resolve_media_input(p)
+            if idx == 0:
+                media.append(types.InputMediaPhoto(media_input, caption=caption, parse_mode="HTML"))
+            else:
+                media.append(types.InputMediaPhoto(media_input))
+        bot.send_media_group(user_id, media)
+    else:
+        bot.send_message(user_id, caption, parse_mode="HTML")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(text="🚀 Выложить", callback_data=f"post_publish_{actual_product_id}"),
+        types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"post_edit_{actual_product_id}")
+    )
+    markup.add(types.InlineKeyboardButton(text="❌ Отменить", callback_data=f"post_cancel_{actual_product_id}"))
+    bot.send_message(user_id, "Предпросмотр поста. Что делаем?", reply_markup=markup)
+    temp_data[user_id]['step'] = 'preview'
 
 @bot.message_handler(func=lambda m: temp_data.get(m.from_user.id, {}).get('step') == 'edit_text')
 def handle_new_caption(message):
@@ -2449,13 +2662,13 @@ def admin_user_info_text(message):
 def admin_set_discount_text(message):
     """Обработчик кнопки 'Установить скидку'"""
     clear_temp_data(message.from_user.id)
-    set_discount(message)
+    bot.send_message(message.from_user.id, "Использование: /set_discount [user_id] [%]")
 
 @bot.message_handler(func=lambda msg: msg.text == '💰 Добавить монеты')
 def admin_add_coins_text(message):
     """Обработчик кнопки 'Добавить монеты'"""
     clear_temp_data(message.from_user.id)
-    add_coins(message)
+    bot.send_message(message.from_user.id, "Использование: /add_coins [user_id] [amount]")
 
 @bot.message_handler(func=lambda msg: msg.text == '📤 Загрузить товары')
 def admin_upload_products_text(message):
@@ -2491,7 +2704,17 @@ def admin_export_products_text(message):
 def admin_order_status_text(message):
     """Обработчик кнопки 'Статус заказов'"""
     clear_temp_data(message.from_user.id)
-    order_status_command(message)
+    bot.send_message(
+        message.from_user.id,
+        "Использование: /order_status [order_id] [status]\n\n"
+        "Примеры статусов:\n"
+        "• НОВЫЙ\n"
+        "• ПОДТВЕРЖДЕН\n" 
+        "• ОПЛАЧЕН\n"
+        "• ОТПРАВЛЕН\n"
+        "• ДОСТАВЛЕН\n"
+        "• ОТМЕНЕН"
+    )
 
 @bot.message_handler(commands=['orders'])
 def list_orders(message):
@@ -3600,7 +3823,12 @@ def ask_delivery_type(message):
             f"👤 ФИО: {temp_data[user_id]['order']['full_name']}\n"
             f"📞 Телефон: {temp_data[user_id]['order']['phone']}\n"
             f"🚚 Способ: {temp_data[user_id]['order']['delivery_type']}\n\n"
-            f"💳 Теперь отправьте скриншот чека об оплате"
+            f"💳 Теперь отправьте скриншот чека об оплате\n\n"
+            f"РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ\n\n"
+            f"2200154531899085 \nАльфа-Банк\n\n"
+            f"5280413753453047\nТ-банк\n\n"
+            f"5228600520272271\nСБЕР\n\n"
+            f"8-903-191-98-48 \nСПБ - Яна Ж."
         )
         
         bot.send_message(user_id, order_summary, reply_markup=remove_markup)
@@ -3832,7 +4060,7 @@ def show_order_confirmation(user_id):
         markup.add(confirm_btn, edit_btn, cancel_btn)
         
         bot.send_message(user_id, order_summary, reply_markup=markup)
-
+        
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
     temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_city')
@@ -4396,7 +4624,12 @@ def process_delivery_info(message):
         payment_request = (
             "✅ Данные доставки получены!\n\n"
             "Теперь отправьте скриншот чека об оплате\n\n"
-            "💳 После оплаты сделайте скриншот и отправьте его сюда"
+            "💳 После оплаты сделайте скриншот и отправьте его сюда\n\n"
+            "РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ\n\n"
+            "2200154531899085 \nАльфа-Банк\n\n"
+            "5280413753453047\nТ-банк\n\n"
+            "5228600520272271\nСБЕР\n\n"
+            "8-903-191-98-48 \nСПБ - Яна Ж."
         )
         
         bot.send_message(user_id, payment_request)
@@ -4744,9 +4977,13 @@ def handle_review(message):
         if len(review_data['photos']) < 3:
             review_data['photos'].append(message.photo[-1].file_id)
             remaining = 3 - len(review_data['photos'])
-            bot.send_message(user_id, f"📸 Фото добавлено. Можно добавить еще {remaining} фото или отправьте /done для завершения")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Завершить", callback_data="review_done"))
+            bot.send_message(user_id, f"📸 Фото добавлено. Можно добавить еще {remaining} фото или нажмите 'Завершить' для отправки", reply_markup=markup)
         else:
-            bot.send_message(user_id, "❌ Можно прикрепить не более 3 фотографий. Отправьте /done для завершения")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Завершить", callback_data="review_done"))
+            bot.send_message(user_id, "❌ Можно прикрепить не более 3 фотографий. Нажмите 'Завершить' для отправки", reply_markup=markup)
             
     elif message.content_type == 'text':
         text = message.text.strip()
@@ -4774,16 +5011,48 @@ def handle_review(message):
             remaining_photos = 3 - photos_count
             
             if photos_count > 0:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("✅ Завершить", callback_data="review_done"))
                 bot.send_message(
                     user_id, 
                     f"✅ Текст отзыва сохранен. Прикреплено фото: {photos_count}/3. "
-                    f"Можете добавить еще {remaining_photos} фото или отправьте /done для завершения"
+                    f"Можете добавить еще {remaining_photos} фото или нажмите 'Завершить' для отправки",
+                    reply_markup=markup
                 )
             else:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("✅ Завершить", callback_data="review_done"))
                 bot.send_message(
                     user_id, 
-                    f"✅ Текст отзыва сохранен. Можете прикрепить до {remaining_photos} фото или отправьте /done для завершения"
+                    f"✅ Текст отзыва сохранен. Можете прикрепить до {remaining_photos} фото или нажмите 'Завершить' для отправки",
+                    reply_markup=markup
                 )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'review_done')
+def handle_review_done(call):
+    try:
+        user_id = call.from_user.id
+        if temp_data.get(user_id, {}).get('step') != 'writing_review':
+            bot.answer_callback_query(call.id, "Нет активного отзыва")
+            return
+        review_data = temp_data.get(user_id) or {}
+        # Проверяем, что есть текст
+        if not review_data.get('text'):
+            bot.answer_callback_query(call.id, "Сначала напишите текст отзыва")
+            bot.send_message(user_id, "❌ Сначала напишите текст отзыва")
+            return
+        # Отправляем на модерацию
+        send_review_for_moderation(user_id, review_data)
+        if user_id in temp_data:
+            del temp_data[user_id]
+        bot.answer_callback_query(call.id, "Отправлено на модерацию")
+        bot.send_message(user_id, "✅ Отзыв отправлен на модерацию! Ожидайте решения администратора.")
+    except Exception as e:
+        log_error(logger, e, "Ошибка завершения отзыва")
+        try:
+            bot.answer_callback_query(call.id, "Ошибка")
+        except Exception:
+            pass
 
 
 @bot.channel_post_handler(content_types=['text'])
