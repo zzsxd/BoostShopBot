@@ -274,26 +274,66 @@ def yadisk_headers(token: str) -> dict:
 
 def yadisk_list_images(product_id: str) -> list:
     token = get_yadisk_tokens()
-    folder = f"{YANDEX_DISK_BASE_PATH}/{product_id}"
-    params = {
-        "path": folder,
-        "limit": 1000,
-        "fields": "name,_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.media_type",
-        "_embedded.limit": 1000,
-    }
-    r = requests.get("https://cloud-api.yandex.net/v1/disk/resources",
-                     headers=yadisk_headers(token), params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    items = (data.get("_embedded") or {}).get("items", [])
-    # Берем только изображения с префиксом forbot_
-    return [
-        it["path"]
-        for it in items
-        if it.get("type") == "file"
-        and (it.get("media_type") or "").startswith("image")
-        and str(it.get("name", "")).startswith("forbot_")
-    ]
+
+    # Разрешаем переопределить базовый путь в конфиге: yadisk.base_path
+    try:
+        cfg = config.get_config()
+        base_path = (cfg.get('yadisk', {}) or {}).get('base_path') or YANDEX_DISK_BASE_PATH
+    except Exception:
+        base_path = YANDEX_DISK_BASE_PATH
+
+    # Пробуем несколько вариантов директорий: base/<id> и base/Boots/<id>
+    candidate_folders = [f"{base_path}/{product_id}"]
+    if "/Boots" not in base_path:
+        candidate_folders.append(f"{base_path}/Boots/{product_id}")
+    else:
+        # Вариант без "Boots"
+        candidate_folders.append(f"{base_path.replace('/Boots', '')}/{product_id}")
+
+    seen = set()
+    candidate_folders = [p for p in candidate_folders if not (p in seen or seen.add(p))]
+
+    images_prefixed = []
+    images_all = []
+
+    for folder in candidate_folders:
+        params = {
+            "path": folder,
+            "limit": 1000,
+            "fields": "name,_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.media_type",
+            "_embedded.limit": 1000,
+        }
+        resp = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            headers=yadisk_headers(token), params=params, timeout=30
+        )
+        if resp.status_code == 404:
+            # Путь не найден — пробуем следующий
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        items = (data.get("_embedded") or {}).get("items", [])
+
+        # Сначала собираем строго forbot_*, затем общий список изображений
+        for it in items:
+            if it.get("type") != "file":
+                continue
+            if not (it.get("media_type") or "").startswith("image"):
+                continue
+            name = str(it.get("name", ""))
+            path = it.get("path")
+            if not path:
+                continue
+            if name.startswith("forbot_"):
+                images_prefixed.append(path)
+            images_all.append(path)
+
+        # Если нашли что-то в этой папке — прекращаем искать дальше (приоритет первой найденной)
+        if images_prefixed or images_all:
+            break
+
+    # Отдаём приоритет файлам с префиксом forbot_, иначе любые изображения
+    return images_prefixed if images_prefixed else images_all
 
 def yadisk_get_download_href(file_path: str) -> str:
     token = get_yadisk_tokens()
@@ -389,9 +429,20 @@ def show_product(user_id, product_id):
     description_full = get_product_field(product, 'description_full', '')
     description_old = get_product_field(product, 'description', '')
     table_id = get_product_field(product, 'table_id', '')
-    # Фолбэк: если в products.table_id пусто, показываем введённый админом артикул
-    if table_id is None or not str(table_id).strip():
-        table_id = temp_data.get(user_id, {}).get('table_id', product_id)
+    # Для отображения артикула используем table_id, а при его отсутствии — model_id из вариаций.
+    # Никогда не показываем числовой product_id как артикул.
+    first_model_id_for_display = None
+    try:
+        first_model_id_for_display = next((v.get('model_id') for v in variations if v.get('model_id')), None)
+    except Exception:
+        pass
+    # Также учитываем временно введённый админом артикул при создании поста
+    admin_entered_table_id = temp_data.get(user_id, {}).get('table_id') if user_id in temp_data else None
+    article_to_show = (str(table_id).strip() if table_id and str(table_id).strip() else None) 
+    if not article_to_show and admin_entered_table_id and str(admin_entered_table_id).strip():
+        article_to_show = str(admin_entered_table_id).strip()
+    if not article_to_show and first_model_id_for_display and str(first_model_id_for_display).strip():
+        article_to_show = str(first_model_id_for_display).strip()
     keywords = get_product_field(product, 'keywords', '')
     price = get_product_field(product, 'price', 0)
     
@@ -417,8 +468,8 @@ def show_product(user_id, product_id):
             caption_parts.append(quoted_description)
     
     # Артикул товара
-    if table_id is not None and str(table_id).strip():
-        caption_parts.append(f"🆔 Артикул: `{str(table_id).strip()}`")
+    if article_to_show:
+        caption_parts.append(f"🆔 Артикул: `{article_to_show}`")
     
     # Цена
     if price > 0:
@@ -457,6 +508,63 @@ def show_product(user_id, product_id):
     else:
         markup = None
         
+    # Пытаемся получить фотографии с Яндекс.Диска, пробуя несколько идентификаторов в порядке приоритета:
+    # 1) table_id (артикул), 2) model_id из вариаций, 3) числовой product_id
+    photos = []
+    candidate_ids = []
+    if article_to_show:
+        candidate_ids.append(article_to_show)
+    # Берём первый model_id из доступных вариаций, если есть
+    try:
+        first_model_id = next((v.get('model_id') for v in variations if v.get('model_id')), None)
+        if first_model_id and str(first_model_id).strip() not in candidate_ids:
+            candidate_ids.append(str(first_model_id).strip())
+    except Exception:
+        pass
+    # Фолбэк на product_id
+    if str(product_id) not in candidate_ids:
+        candidate_ids.append(str(product_id))
+
+    used_identifier = None
+    for candidate in candidate_ids:
+        try:
+            photos = download_photos_from_yadisk(candidate)
+            if photos:
+                used_identifier = candidate
+                log_info(logger, f"Найдено {len(photos)} фото по идентификатору '{candidate}'")
+                break
+            else:
+                log_info(logger, f"Нет фото по идентификатору '{candidate}'")
+        except Exception as e:
+            log_error(logger, e, f"Ошибка скачивания фото с Яндекс.Диска для '{candidate}'")
+            photos = []
+    
+    # Если есть фотографии с Яндекс.Диска, отправляем только первую
+    if photos:
+        first_file = None
+        try:
+            first_path = photos[0]
+            first_file = open(first_path, 'rb')
+            bot.send_photo(
+                user_id,
+                first_file,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            log_error(logger, e, f"Ошибка отправки фото для товара {product_id}")
+        finally:
+            try:
+                if first_file:
+                    first_file.close()
+            except Exception:
+                pass
+            # Удаляем все временные файлы
+            cleanup_local_files(photos)
+    
+    # Фолбэк: пытаемся использовать photo_id из базы данных
     photo_id = get_product_field(product, 'photo_id')
     if photo_id and photo_id != 'None' and photo_id != 'invalid':
         try:
@@ -469,8 +577,9 @@ def show_product(user_id, product_id):
             )
             return
         except Exception as e:
-            print(f"Ошибка отправки фото: {e}")
+            log_error(logger, e, f"Ошибка отправки фото из БД: {e}")
     
+    # Если нет фотографий, отправляем только текст
     bot.send_message(
         user_id,
         caption,
@@ -595,6 +704,7 @@ def process_products_file(message):
                 sample_msg += f"{i+1}. {row['Модель']} - {row['Размер']} - {row['Цена продажи']}₽\n"
             
             bot.send_message(user_id, sample_msg)
+            return
             
         else:
             # Старая структура с одним листом
@@ -812,7 +922,7 @@ def send_review_for_moderation(user_id, review_data):
                 msg_one = bot.send_photo(**photo_params)
                 pending_reviews[review_id]['message_id'] = msg_one.message_id
                 # Остальные фото по отдельности
-                for photo in review_data['photos'][1:]:
+            for photo in review_data['photos'][1:]:
                     single_photo_params = {
                         "chat_id": admin_group_id,
                         "photo": photo
@@ -1255,8 +1365,14 @@ def show_profile(message):
 
 @bot.message_handler(func=lambda msg: msg.text == '🎁 Акции')
 def show_promo(message):
+    # Кнопка "Акции" заменена на переход в техподдержку
     clear_temp_data(message.from_user.id)
-    bot.send_message(message.chat.id, "🔥 Горячие акции")
+    return support(message)
+
+@bot.message_handler(func=lambda msg: msg.text == '🛟 Тех. Поддержка')
+def support_from_button(message):
+    clear_temp_data(message.from_user.id)
+    return support(message)
 
 @bot.message_handler(func=lambda msg: msg.text == '📢 Отзывы')
 def show_reviews(message):
@@ -1916,7 +2032,7 @@ def handle_enter_product_id(message):
     product_name = get_product_field(product, 'name', 'Неизвестно')
     description_full = get_product_field(product, 'description_full', '')
     description_old = get_product_field(product, 'description', '')
-    table_id = get_product_field(product, 'table_id', '')
+    table_id_db = get_product_field(product, 'table_id', '')
     keywords = get_product_field(product, 'keywords', '')
     price = get_product_field(product, 'price', 0)
     
@@ -1975,12 +2091,31 @@ def handle_enter_product_id(message):
         lines = description_clean.split('\n')
         description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
     if description_clean:
-        caption_parts.append(description_clean)
+        caption_parts.append(f"<blockquote>{description_clean}</blockquote>")
     
+    # Определяем артикул для отображения: table_id из БД → введённый админом table_id → первый model_id
+    try:
+        preview_variations = variations or []
+        if (not preview_variations) and table_id_db:
+            preview_variations = db_actions.get_product_variations_by_model_id(table_id_db)
+    except Exception:
+        preview_variations = []
+    first_model_id_for_display = None
+    try:
+        first_model_id_for_display = next((v.get('model_id') for v in preview_variations if v.get('model_id')), None)
+    except Exception:
+        first_model_id_for_display = None
+    admin_table_id = product_id  # ввод админа в этом шаге — это артикул (папка на Я.Диске)
+    article_to_show = (str(table_id_db).strip() if table_id_db and str(table_id_db).strip() else None)
+    if not article_to_show and admin_table_id and str(admin_table_id).strip():
+        article_to_show = str(admin_table_id).strip()
+    if not article_to_show and first_model_id_for_display and str(first_model_id_for_display).strip():
+        article_to_show = str(first_model_id_for_display).strip()
+
     # Блок деталей: Артикул, Размеры, Цена (между ними один перевод строки)
     details_lines = []
-    if table_id and table_id.strip():
-        details_lines.append(f"<b>Артикул: {table_id}</b>")
+    if article_to_show:
+        details_lines.append(f"<b>Артикул: {article_to_show}</b>")
     if numeric_sizes_sorted:
         sizes_text = ", ".join(numeric_sizes_sorted[:10])
         if len(numeric_sizes_sorted) > 10:
@@ -2009,7 +2144,7 @@ def handle_enter_product_id(message):
     
     # Возврат
     caption_parts.append("Возврат в течение 14 дней")
-
+    
     # Ссылки: Купить и Поддержка (как гиперссылки)
     try:
         bot_username = bot.get_me().username
@@ -2031,8 +2166,8 @@ def handle_enter_product_id(message):
         h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
         if h_lines:
             hashtags_to_show = ' '.join(h_lines)
-    if not hashtags_to_show and keywords and keywords.strip():
-        hashtags_to_show = keywords.strip()
+    if not hashtags_to_show and keywords and str(keywords).strip():
+        hashtags_to_show = str(keywords).strip()
     if hashtags_to_show:
         caption_parts.append(f"{hashtags_to_show}")
     
@@ -2080,19 +2215,35 @@ def handle_post_publish(call):
         if not files:
             bot.answer_callback_query(call.id, "Нет файлов для публикации")
             return
-        # Формируем подпись из сохранённых значений в требуемом формате
+        # Формируем подпись из сохранённых значений в требуемом формате (учитывая правки админа)
         product = db_actions.get_product(int(product_id)) if product_id and str(product_id).isdigit() else None
-        name = get_product_name(product) if product else f"Товар {product_id}"
+        override_name = data.get('override_name')
+        override_description = data.get('override_description')
+        override_price = data.get('override_price') if 'override_price' in data else None
+        override_tags = data.get('override_tags', '')
+
+        name = override_name or (get_product_name(product) if product else f"Товар {product_id}")
         description_full = get_product_field(product, 'description_full', '') if product else ''
         description_old = get_product_field(product, 'description', '') if product else ''
         table_id = get_product_field(product, 'table_id', '') if product else ''
-        if not table_id or not str(table_id).strip():
-            table_id = temp_data.get(user_id, {}).get('table_id', product_id)
+        admin_table_id = temp_data.get(user_id, {}).get('table_id')
+        # Определяем артикул для показа: table_id → admin_table_id → первый model_id
+        first_model_id_for_display = None
+        try:
+            _vars_for_id = db_actions.get_product_variations(int(product_id)) if product else []
+            first_model_id_for_display = next((v.get('model_id') for v in _vars_for_id if v.get('model_id')), None)
+        except Exception:
+            first_model_id_for_display = None
+        article_to_show = (str(table_id).strip() if table_id and str(table_id).strip() else None)
+        if not article_to_show and admin_table_id and str(admin_table_id).strip():
+            article_to_show = str(admin_table_id).strip()
+        if not article_to_show and first_model_id_for_display and str(first_model_id_for_display).strip():
+            article_to_show = str(first_model_id_for_display).strip()
         keywords = get_product_field(product, 'keywords', '') if product else ''
-        price = get_product_field(product, 'price', 0) if product else 0
+        price = override_price if override_price is not None else (get_product_field(product, 'price', 0) if product else 0)
 
         # Описание без строк-хэштегов
-        description_to_show = description_full if description_full else description_old
+        description_to_show = override_description or (description_full if description_full else description_old)
         description_clean = description_to_show
         if description_clean and '\n' in description_clean:
             _lines = description_clean.split('\n')
@@ -2104,6 +2255,8 @@ def handle_post_publish(call):
             h_lines = [ln.strip() for ln in description_to_show.split('\n') if ln.strip().startswith('#')]
             if h_lines:
                 hashtags_to_show = ' '.join(h_lines)
+        if not hashtags_to_show and override_tags:
+            hashtags_to_show = override_tags.strip()
         if not hashtags_to_show and keywords:
             hashtags_to_show = keywords.strip()
 
@@ -2113,9 +2266,9 @@ def handle_post_publish(call):
         parts = []
         parts.append(f"{name}")
         if description_clean:
-            parts.append(f"{description_clean}")
-        if table_id:
-            parts.append(f"<b>Артикул: {table_id}</b>")
+            parts.append(f"<blockquote>{description_clean}</blockquote>")
+        if article_to_show:
+            parts.append(f"<b>Артикул: {article_to_show}</b>")
         # Размеры
         try:
             variations = db_actions.get_product_variations(int(product_id)) if product else []
@@ -2240,8 +2393,8 @@ def handle_post_edit(call):
                               text="Что хотите отредактировать?", reply_markup=markup)
     except Exception:
         bot.send_message(user_id, "Что хотите отредактировать?", reply_markup=markup)
-    temp_data.setdefault(user_id, {})
-    temp_data[user_id]['step'] = 'edit_menu'
+        temp_data.setdefault(user_id, {})
+        temp_data[user_id]['step'] = 'edit_menu'
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('post_editmenu_'))
 def handle_post_edit_menu(call):
@@ -2353,9 +2506,19 @@ def _render_post_preview(user_id: int):
     product_name = data.get('override_name') or (get_product_field(product, 'name', 'Неизвестно') if product else f"Товар {actual_product_id}")
     description_full = get_product_field(product, 'description_full', '') if product else ''
     description_old = get_product_field(product, 'description', '') if product else ''
-    table_id = get_product_field(product, 'table_id', '') if product else ''
-    if not table_id or not str(table_id).strip():
-        table_id = table_id_input
+    table_id_db = get_product_field(product, 'table_id', '') if product else ''
+    admin_table_id = table_id_input
+    # Определяем артикул для показа: table_id из БД → admin_table_id → первый model_id
+    try:
+        _vars_for_id = db_actions.get_product_variations(int(actual_product_id)) if product else []
+        first_model_id_for_display = next((v.get('model_id') for v in _vars_for_id if v.get('model_id')), None)
+    except Exception:
+        first_model_id_for_display = None
+    article_to_show = (str(table_id_db).strip() if table_id_db and str(table_id_db).strip() else None)
+    if not article_to_show and admin_table_id and str(admin_table_id).strip():
+        article_to_show = str(admin_table_id).strip()
+    if not article_to_show and first_model_id_for_display and str(first_model_id_for_display).strip():
+        article_to_show = str(first_model_id_for_display).strip()
     keywords = get_product_field(product, 'keywords', '') if product else ''
     price_value = data.get('override_price') if 'override_price' in data else (get_product_field(product, 'price', 0) if product else 0)
     description_to_show = data.get('override_description') or (description_full if description_full else description_old)
@@ -2401,9 +2564,9 @@ def _render_post_preview(user_id: int):
     parts = []
     parts.append(f"{product_name}")
     if description_clean:
-        parts.append(f"{description_clean}")
-    if table_id:
-        parts.append(f"<b>Артикул: {table_id}</b>")
+        parts.append(f"<blockquote>{description_clean}</blockquote>")
+    if article_to_show:
+        parts.append(f"<b>Артикул: {article_to_show}</b>")
     if numeric_sizes_sorted:
         sizes_text = ", ".join(numeric_sizes_sorted[:10])
         if len(numeric_sizes_sorted) > 10:
@@ -2907,13 +3070,13 @@ def test_order(message):
             "📍 Адрес: Улица, дом, квартира\n"
             "👤 ФИО: Иванов Иван Иванович\n"
             "📞 Телефон: +79123456789\n"
-            "🚚 Доставка: Почта России\n\n"
+            "🚚 Доставка: СДЭК\n\n"
             "Пример:\n"
             "Москва\n"
             "ул. Ленина, д. 10, кв. 5\n"
             "Иванов Иван Иванович\n"
             "+79123456789\n"
-            "Почта России"
+            "СДЭК"
         )
         
         bot.send_message(user_id, delivery_form)
@@ -3770,7 +3933,6 @@ def ask_phone(message):
     temp_data[user_id]['order']['step'] = 'ask_delivery_type'
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("Почта России"))
     markup.add(types.KeyboardButton("СДЭК"))
     markup.add(types.KeyboardButton("Другое"))
     
@@ -3939,21 +4101,7 @@ def confirm_order_final(message):
             # Проверяем ачивки
             check_achievement_conditions(user_id, 'first_purchase')
             
-            # Проверяем достижение первого заказа
-            user_data = db_actions.get_user_data(user_id)
-            if user_data and user_data['orders'] == 1:
-                achievement_data = ACHIEVEMENTS.get('first_purchase') or {
-                    'name': '🎉 Первый заказ',
-                    'description': 'Сделал первый заказ',
-                    'category': 'ПОКУПКИ',
-                    'bs_coin_reward': 50,
-                    'discount_bonus': 0
-                }
-                db_actions.add_achievement(user_id, "first_purchase", achievement_data)
-                bot.send_message(
-                    user_id,
-                    "🎉 Вы получили достижение «Первый заказ» +50 BS Coin!"
-                )
+            # Достижения обрабатываются централизованно в check_achievement_conditions
         else:
             bot.send_message(user_id, "❌ Ошибка оформления заказа")
         
@@ -4021,7 +4169,6 @@ def handle_edit_choice(message):
     elif choice == "🚚 Способ доставки":
         temp_data[user_id]['order']['step'] = 'edit_delivery_type'
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add(types.KeyboardButton("Почта России"))
         markup.add(types.KeyboardButton("СДЭК"))
         markup.add(types.KeyboardButton("Другое"))
         bot.send_message(user_id, "🚚 Выберите способ доставки:", reply_markup=markup)
@@ -4060,7 +4207,7 @@ def show_order_confirmation(user_id):
         markup.add(confirm_btn, edit_btn, cancel_btn)
         
         bot.send_message(user_id, order_summary, reply_markup=markup)
-        
+
 @bot.message_handler(func=lambda message: 
     message.from_user.id in temp_data and 
     temp_data[message.from_user.id].get('order', {}).get('step') == 'edit_city')

@@ -45,7 +45,7 @@ class Bot_inline_btns:
     def start_buttons(self):
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         btn1 = types.KeyboardButton('👤 Мой профиль')
-        btn2 = types.KeyboardButton('🎁 Акции')
+        btn2 = types.KeyboardButton('🛟 Тех. Поддержка')
         btn3 = types.KeyboardButton('📢 Отзывы')
         btn4 = types.KeyboardButton('🛒 Заказать товар')
         btn5 = types.KeyboardButton('🏆 Ачивки')
