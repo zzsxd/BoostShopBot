@@ -54,23 +54,11 @@ class Bot_inline_btns:
 
     def profile_buttons(self, user_data):
         markup = types.InlineKeyboardMarkup()
-        btn1 = types.InlineKeyboardButton(
-            text=f"💎 BS Coin: {user_data['bs_coin']}",
-            callback_data="bs_coin_info"
-        )
         btn2 = types.InlineKeyboardButton(
             text="🔗 Реферальная ссылка", 
             callback_data="ref_link"
         )
-        
-        if user_data['bs_coin'] >= 500:
-            btn3 = types.InlineKeyboardButton(
-                text="🔄 Обменять 500 BS Coin на 5% скидку",
-                callback_data="exchange_coin"
-            )
-            markup.add(btn3)
-        
-        markup.add(btn1, btn2)
+        markup.add(btn2)
         return markup
 
     def product_buttons(self, products):
