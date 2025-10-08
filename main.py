@@ -447,61 +447,50 @@ def show_product(user_id, product_id):
     price = get_product_field(product, 'price', 0)
     
     # Формируем описание
-    caption_parts = []
-    
-    # Название товара
-    caption_parts.append(f"🛍️ *{product_name}*")
+    title_line = f"🛍️ *{product_name}*"
     
     # Описание товара (приоритет новому полю, если пустое - используем старое)
     description_to_show = description_full if description_full else description_old
+    description_block = None
     if description_to_show and description_to_show.strip():
-        # Убираем хештеги из описания, если они есть
         description_clean = description_to_show
         if '\n' in description_clean:
             lines = description_clean.split('\n')
-            # Убираем строки с хештегами из описания
             description_clean = '\n'.join([line for line in lines if not line.strip().startswith('#')]).strip()
-        
         if description_clean:
-            # Форматируем как blockquote
-            quoted_description = '\n'.join([f"> {line}" for line in description_clean.split('\n')])
-            caption_parts.append(quoted_description)
+            description_block = '\n'.join([f"> {line}" for line in description_clean.split('\n')])
     
-    # Артикул товара
+    # Детали без лишних отступов
+    detail_lines = []
     if article_to_show:
-        caption_parts.append(f"🆔 Артикул: `{article_to_show}`")
-    
-    # Цена
+        detail_lines.append(f"🆔 Артикул: `{article_to_show}`")
     if price > 0:
-        caption_parts.append(f"💰 Цена: {price}₽")
+        detail_lines.append(f"💰 Цена: {price}₽")
     else:
-        caption_parts.append("💰 Цена: Уточняйте")
-    
-    # Доступные размеры
+        detail_lines.append("💰 Цена: Уточняйте")
     if available_sizes:
-        caption_parts.append("📏 Доступные размеры:")
-    for variation in available_sizes:
-            caption_parts.append(f"• {variation['size']} - {variation['quantity']} шт.")
+        detail_lines.append("📏 Доступные размеры:")
+        for variation in available_sizes:
+            detail_lines.append(f"• {variation['size']} - {variation['quantity']} шт.")
     
     # Хештеги (извлекаем из описания или используем поле keywords)
     hashtags_to_show = ""
-    
-    # Сначала пытаемся извлечь хештеги из описания
     if description_to_show and '\n' in description_to_show:
         lines = description_to_show.split('\n')
         hashtag_lines = [line.strip() for line in lines if line.strip().startswith('#')]
         if hashtag_lines:
             hashtags_to_show = ' '.join(hashtag_lines)
-    
-    # Если хештеги не найдены в описании, используем поле keywords
     if not hashtags_to_show and keywords and keywords.strip():
         hashtags_to_show = keywords.strip()
     
-    # Добавляем хештеги в конец
+    parts_for_caption = [title_line]
+    if description_block:
+        parts_for_caption.append(description_block)
+    if detail_lines:
+        parts_for_caption.append('\n'.join(detail_lines))
     if hashtags_to_show:
-        caption_parts.append(f"\n{hashtags_to_show}")
-    
-    caption = "\n\n".join(caption_parts)
+        parts_for_caption.append(hashtags_to_show)
+    caption = "\n\n".join(parts_for_caption)
     
     if available_sizes:
         markup = buttons.size_selection_buttons(available_sizes)
@@ -604,23 +593,7 @@ def check_and_fix_photos():
         log_error(logger, e, "Ошибка при проверке фото")
 
 def handle_daily_bonus(user_id):
-    user_data = db_actions.get_user_data(user_id)
-    if not user_data:
-        return False
-    
-    last_active = user_data.get('last_active')
-    now = datetime.now()
-    
-    if isinstance(last_active, str):
-        try:
-            last_active = datetime.strptime(last_active, "%Y-%m-%d %H:%M:%S.%f")
-        except ValueError:
-            last_active = None
-    
-    if not last_active or (now - last_active) > timedelta(hours=24):
-        db_actions.update_user_stats(user_id, 'bs_coin', 10)
-        db_actions.update_last_active(user_id, now)
-        return True
+    # Ежедневный бонус отключен
     return False
 
 def check_comment_achievement(user_id):
@@ -1312,8 +1285,7 @@ def start(message):
             except (ValueError, IndexError):
                 bot.send_message(user_id, "❌ Неверная ссылка на товар")
     
-    if handle_daily_bonus(user_id):
-        bot.send_message(user_id, "🎉 Ежедневный бонус: 10 BS Coin зашли вам на счет!")
+    # Ежедневный бонус отключен
     
     user_data = db_actions.get_user_data(user_id)
     welcome_msg = (
@@ -1369,7 +1341,7 @@ def show_promo(message):
     clear_temp_data(message.from_user.id)
     return support(message)
 
-@bot.message_handler(func=lambda msg: msg.text == '🛟 Тех. Поддержка')
+@bot.message_handler(func=lambda msg: msg.text == '🆘 Поддержка 24/7')
 def support_from_button(message):
     clear_temp_data(message.from_user.id)
     return support(message)
@@ -1426,6 +1398,17 @@ def support(message):
 def handle_support_description(message):
     user_id = message.from_user.id
     text = message.text or ''
+
+    # Если пользователь нажал одну из основных кнопок во время ввода описания поддержки,
+    # корректно перенаправим вместо отправки текста в поддержку
+    if text == '🛒 Заказать товар':
+        try:
+            # Снимаем состояние поддержки
+            if user_id in temp_data and 'support_step' in temp_data[user_id]:
+                del temp_data[user_id]['support_step']
+        except Exception:
+            pass
+        return handle_order_button(message)
     temp_data[user_id]['support_step'] = 'submitted'
     temp_data[user_id]['support_text'] = text
     user_data = db_actions.get_user_data(user_id) or {}
@@ -1706,7 +1689,7 @@ def profile(message):
     
     coin_info = ""
     if user_data['bs_coin'] < 100:
-        coin_info = "\n\n💡 Как получить BS Coin:\n• /start - ежедневный бонус\n• /ref - реферальная система\n• Активность в канале\n• 🏆 <a href='https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19'>Достижения - подробнее</a>"
+        coin_info = "\n\n💡 Как получить BS Coin:\n• /ref - реферальная система\n• Активность в канале\n• 🏆 <a href='https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19'>Достижения - подробнее</a>"
     
     profile_msg = (
         f"👤 Ваш профиль:\n\n"
@@ -1738,43 +1721,23 @@ def show_achievements(message):
         bot.send_message(user_id, "Сначала зарегистрируйтесь с помощью /start")
         return
     
-    # Получаем ачивки по категориям
-    bridge_achievements = db_actions.get_achievements_by_category(user_id, 'МОСТ')
-    shore_achievements = db_actions.get_achievements_by_category(user_id, 'БЕРЕГ')
-    collective_achievements = db_actions.get_achievements_by_category(user_id, 'КОЛЛЕКТИВ')
+    # Формируем фиксированный текст о системе ачивок с форматированием
+    message_text = (
+        "🏆 Система ачивок <b>BridgeSide</b>\n\n"
+        "Добро пожаловать на свой Берег.\n"
+        "Здесь мы отмечаем Ваш вклад цифровыми ачивками и внутренней валютой — BS Coin.\n\n"
+        "— Линия «МОСТ» — стиль + технологии\n"
+        "✅ 🛸 Пилот Моста — Первая покупка → <b>+500 BS Coin</b>\n"
+        "✅ ⚙️ Инженер Стиля — Лук: 3+ вещи разных брендов в одном заказе → <b>+1000 BS Coin</b>\n\n"
+        "— Линия «БЕРЕГ» — лояльность\n"
+        "✅ 💡 Первопроходец — Первый отзыв с фото → <b>+100 BS Coin</b>\n\n"
+        "— Линия «КОЛЛЕКТИВ» — за приглашения\n"
+        "✅ 🔌 <b>Соединяющий</b> — Привёл 3 зарегистрировавшихся друга по реф-ссылке → <b>+300 BS Coin</b>\n\n"
+        "🏅 Выполняйте действия в боте и магазине для получения ачивок!\n"
+        "🪪 Ваши полученные ачивки Вы можете посмотреть в разделе \"Профиль\""
+    )
     
-    # Получаем все доступные ачивки
-    all_achievements = db_actions.get_user_achievements(user_id)
-    earned_codes = {ach['achievement_code'] for ach in all_achievements}
-    
-    message_text = "🏆 Система ачивок BridgeSide\n\n"
-    message_text += "Добро пожаловать на свой Берег. Здесь мы отмечаем ваш вклад цифровыми ачивками и внутренней валютой — BS Coin.\n\n"
-    
-    # Линия "МОСТ" — стиль + технологии
-    message_text += "— Линия «МОСТ» — стиль + технологии\n"
-    for code, data in ACHIEVEMENTS.items():
-        if data['category'] == 'МОСТ':
-            status = "✅" if code in earned_codes else "⭕"
-            message_text += f"{status} {data['name']} — {data['description']} → +{data['bs_coin_reward']} BS Coin\n"
-    
-    message_text += "\n— Линия «БЕРЕГ» — лояльность\n"
-    for code, data in ACHIEVEMENTS.items():
-        if data['category'] == 'БЕРЕГ':
-            status = "✅" if code in earned_codes else "⭕"
-            reward_text = f"+{data['bs_coin_reward']} BS Coin"
-            if data['discount_bonus'] > 0:
-                reward_text += f" +{data['discount_bonus']}% скидка"
-            message_text += f"{status} {data['name']} — {data['description']} → {reward_text}\n"
-    
-    message_text += "\n— Линия «КОЛЛЕКТИВ» — за приглашения\n"
-    for code, data in ACHIEVEMENTS.items():
-        if data['category'] == 'КОЛЛЕКТИВ':
-            status = "✅" if code in earned_codes else "⭕"
-            message_text += f"{status} {data['name']} — {data['description']} → +{data['bs_coin_reward']} BS Coin\n"
-    
-    message_text += "\n💡 Выполняйте действия в боте и магазине для получения ачивок!"
-    
-    bot.send_message(user_id, message_text)
+    bot.send_message(user_id, message_text, parse_mode="HTML")
 
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
@@ -3226,10 +3189,9 @@ def how_to_get_coins(call):
         chat_id=user_id,
         message_id=call.message.message_id,
         text=f"💎 Способы получения BS Coin:\n\n"
-            f"1. 🎁 Ежедневный бонус: +10 BS Coin каждый день (/start)\n"
-            f"2. 👥 Реферальная система: +100 BS Coin за каждого приглашенного друга (/ref)\n"
-            f"3. 💬 Активность в канале: комментируйте посты и получайте монеты\n"
-            f"4. 🏆 Достижения: выполняйте задания и получайте бонусы\n\n"
+            f"1. 👥 Реферальная система: +100 BS Coin за каждого приглашенного друга (/ref)\n"
+            f"2. 💬 Активность в канале: комментируйте посты и получайте монеты\n"
+            f"3. 🏆 Достижения: выполняйте задания и получайте бонусы\n\n"
             f"📖 [Подробнее о системе ачивок](https://telegra.ph/FAQ-Sistema-achivok--Bridge-Side-Collective-09-19)\n\n"
             f"💰 Ваш текущий баланс: {user_data['bs_coin']} BS Coin",
         reply_markup=markup
@@ -3250,19 +3212,21 @@ def ref_link(call):
     
     markup = types.InlineKeyboardMarkup()
     btn1 = types.InlineKeyboardButton(
-        text="💎 Вернуться к товарам",
-        callback_data="back_to_catalog"
+        text="🔙 Вернуться в профиль",
+        callback_data="back_to_profile"
     )
     markup.add(btn1)
     
     ref_msg = (
-        f"👥 Реферальная система\n\n"
-        f"Приглашайте друзей и получайте бонусы!\n\n"
+        "<b>👥 Реферальная система BridgeSide</b>\n\n"
+        "Приглашайте друзей и получайте бонусы!\n\n"
         f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
-        f"• За каждого приглашенного друга вы получаете 100 BS Coin\n"
-        f"• Ваш друзья получает 50 BS Coin при первом заказе\n\n"
+        "• За каждого приглашенного друга Вы получаете <b>100 BS Coin</b>\n"
+        "• Ваши друзья получают <b>500 BS Coin</b> при первом заказе\n\n"
+        "🏆 Забери ачивку  \"🔌 <b>Соединяющий</b>\" \n"
+        "✅ Привёл 3х зарегистрировавшихся друзей по реф-ссылке → <b>+300 BS Coin</b>\n\n"
         f"🚀 Приглашено друзей: {ref_count}\n"
-        f"💰 Заработано: {ref_count * 100} BS Coin"
+        f"💰 Заработано: <b>{ref_count * 100} BS Coin</b>"
     )
     
     try:
@@ -3281,6 +3245,23 @@ def ref_link(call):
             reply_markup=markup
         )
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'back_to_profile')
+def back_to_profile(call):
+    """Возврат к профилю пользователя из реферального экрана"""
+    try:
+        # В callback сообщение отправлено ботом, поэтому call.message.from_user — это бот.
+        # Передадим в profile подставной объект с корректным user_id из call.from_user.
+        class _Dummy:
+            pass
+        dummy_message = _Dummy()
+        dummy_message.from_user = _Dummy()
+        dummy_message.from_user.id = call.from_user.id
+        profile(dummy_message)
+    except Exception as e:
+        log_error(logger, e, "Ошибка возврата в профиль")
+        bot.answer_callback_query(call.id, "Ошибка возврата в профиль")
 
 
 def publish_product_to_channel(product):
@@ -3315,12 +3296,12 @@ def publish_product_to_channel(product):
                     hashtags = ' '.join(h_lines)
         
         caption_parts = []
-        caption_parts.append(f"{name}")
+        caption_parts.append(f"🛍️ <b>{name}</b>")
         if description:
             caption_parts.append(f"{description}")
         if table_id:
-            caption_parts.append(f"<b>Артикул: {table_id}</b>")
-        caption_parts.append(f"Цена: {price}₽")
+            caption_parts.append(f"🆔 Артикул: <code>{table_id}</code>")
+        caption_parts.append(f"💰 Цена: {price}₽")
 
         # Размеры (если есть в базе)
         try:
@@ -3362,13 +3343,10 @@ def publish_product_to_channel(product):
             bot_username = ''
         deep_link = f"https://t.me/{bot_username}?start=product_{product['product_id']}" if bot_username else ""
         support_link = f"https://t.me/{bot_username}?start=support" if bot_username else ""
-        links_line = []
         if deep_link:
-            links_line.append(f"<a href=\"{deep_link}\">Купить в один клик</a>")
+            caption_parts.append(f"<a href=\"{deep_link}\">🛒 Купить в один клик</a>")
         if support_link:
-            links_line.append(f"<a href=\"{support_link}\">Служба поддержки</a>")
-        if links_line:
-            caption_parts.append(" | ".join(links_line))
+            caption_parts.append(f"<a href=\"{support_link}\">🆘 Служба поддержки</a>")
 
         # Политика возврата
         caption_parts.append("Возврат в течение 14 дней")
@@ -5144,8 +5122,13 @@ def handle_review(message):
             
             if user_id in temp_data:
                 del temp_data[user_id]
-                
-            bot.send_message(user_id, "✅ Отзыв отправлен на модерацию! Ожидайте решения администратора.")
+            
+            buttons = Bot_inline_btns()
+            bot.send_message(
+                user_id,
+                "✅ Отзыв отправлен на модерацию! Ожидайте решения администратора.",
+                reply_markup=buttons.start_buttons()
+            )
             
         elif text.lower() == '/cancel':
             if user_id in temp_data:
@@ -5193,7 +5176,12 @@ def handle_review_done(call):
         if user_id in temp_data:
             del temp_data[user_id]
         bot.answer_callback_query(call.id, "Отправлено на модерацию")
-        bot.send_message(user_id, "✅ Отзыв отправлен на модерацию! Ожидайте решения администратора.")
+        buttons = Bot_inline_btns()
+        bot.send_message(
+            user_id,
+            "✅ Отзыв отправлен на модерацию! Ожидайте решения администратора.",
+            reply_markup=buttons.start_buttons()
+        )
     except Exception as e:
         log_error(logger, e, "Ошибка завершения отзыва")
         try:

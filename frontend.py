@@ -45,7 +45,7 @@ class Bot_inline_btns:
     def start_buttons(self):
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         btn1 = types.KeyboardButton('👤 Мой профиль')
-        btn2 = types.KeyboardButton('🛟 Тех. Поддержка')
+        btn2 = types.KeyboardButton('🆘 Поддержка 24/7')
         btn3 = types.KeyboardButton('📢 Отзывы')
         btn4 = types.KeyboardButton('🛒 Заказать товар')
         btn5 = types.KeyboardButton('🏆 Ачивки')
@@ -55,7 +55,7 @@ class Bot_inline_btns:
     def profile_buttons(self, user_data):
         markup = types.InlineKeyboardMarkup()
         btn2 = types.InlineKeyboardButton(
-            text="🔗 Реферальная ссылка", 
+            text="🔗 Реферальная ссылка ➕💰 BS Coin", 
             callback_data="ref_link"
         )
         markup.add(btn2)
